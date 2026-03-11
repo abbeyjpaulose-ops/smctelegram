@@ -37,12 +37,11 @@ MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "180"))
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "30"))
 CONSERVATIVE_SAME_CANDLE = os.getenv("CONSERVATIVE_SAME_CANDLE", "true").lower() == "true"
 
-# Keep-alive web server
 PORT = int(os.getenv("PORT", "10000"))
 
 
 # =========================================================
-# FLASK APP
+# FLASK KEEP-ALIVE APP
 # =========================================================
 app = Flask(__name__)
 
@@ -89,7 +88,6 @@ BOT_STATE: Dict[str, Any] = {
     "last_signal_id": "",
     "pending_signal": None,
     "last_update_id": 0,
-    "last_status_text": "",
 }
 
 
@@ -176,6 +174,29 @@ def get_current_rr() -> float:
     with state_lock:
         rr = BOT_STATE.get("rr", DEFAULT_RR)
     return rr if rr > 0 else DEFAULT_RR
+
+
+def sync_update_offset_on_startup() -> None:
+    """
+    Drain old queued Telegram updates so stale commands do not run after restart.
+    """
+    try:
+        data = get_updates(timeout=1)
+        if not data.get("ok"):
+            return
+
+        updates = data.get("result", [])
+        if not updates:
+            return
+
+        last_id = max(int(u["update_id"]) for u in updates)
+        with state_lock:
+            BOT_STATE["last_update_id"] = last_id
+
+        print(f"Synced Telegram update offset to {last_id}", flush=True)
+
+    except Exception as e:
+        print(f"sync_update_offset_on_startup error: {e}", flush=True)
 
 
 # =========================================================
@@ -266,13 +287,12 @@ def detect_smc_signal(m1: pd.DataFrame) -> Optional[PendingSignal]:
     rr = get_current_rr()
     df = build_confirmed_pivots(m1, SMC_SWING_WINDOW).reset_index(drop=True)
 
-    i = len(df) - 2
+    i = len(df) - 2  # last closed candle
     if i < max(10, SMC_SWING_WINDOW * 2 + 2):
         return None
 
     row = df.iloc[i]
     now = row["timestamp"]
-
     hist = df.iloc[:i].copy()
 
     piv_hi = hist[
@@ -288,7 +308,6 @@ def detect_smc_signal(m1: pd.DataFrame) -> Optional[PendingSignal]:
     last_lo = piv_lo.iloc[-1] if not piv_lo.empty else None
 
     direction = None
-
     if last_hi is not None and float(row["close"]) > float(last_hi["pivot_high"]):
         direction = "long"
     elif last_lo is not None and float(row["close"]) < float(last_lo["pivot_low"]):
@@ -330,7 +349,6 @@ def detect_smc_signal(m1: pd.DataFrame) -> Optional[PendingSignal]:
 
     bos_time = pd.Timestamp(row["timestamp"])
     expires_at = bos_time + pd.Timedelta(minutes=ENTRY_WAIT_BARS)
-
     signal_id = f"{direction}_{bos_time.isoformat()}_{round5(entry)}"
 
     return PendingSignal(
@@ -373,6 +391,7 @@ def manage_pending_trade(m1: pd.DataFrame) -> None:
     if closed_df.empty:
         return
 
+    # Wait for entry
     if not sig.is_active_trade:
         bos_time = pd.Timestamp(sig.bos_time)
         expires_at = pd.Timestamp(sig.expires_at)
@@ -423,6 +442,7 @@ def manage_pending_trade(m1: pd.DataFrame) -> None:
     if not sig.entry_time:
         return
 
+    # Manage active trade
     entry_time = pd.Timestamp(sig.entry_time)
     active_rows = closed_df[closed_df["timestamp"] >= entry_time].copy()
 
@@ -523,6 +543,7 @@ def get_status_text() -> str:
 # =========================================================
 def handle_command(text: str) -> None:
     cmd = text.strip().split()[0].lower()
+    print(f"Processing command: {cmd}", flush=True)
 
     if cmd == "/startbt":
         with state_lock:
@@ -599,11 +620,17 @@ def command_loop() -> None:
                 time.sleep(2)
                 continue
 
-            for upd in data.get("result", []):
+            updates = data.get("result", [])
+            if not updates:
+                continue
+
+            for upd in updates:
                 update_id = int(upd["update_id"])
 
                 with state_lock:
-                    BOT_STATE["last_update_id"] = max(BOT_STATE["last_update_id"], update_id)
+                    if update_id <= BOT_STATE["last_update_id"]:
+                        continue
+                    BOT_STATE["last_update_id"] = update_id
 
                 msg = upd.get("message") or {}
                 chat_id = str((msg.get("chat") or {}).get("id", ""))
@@ -611,12 +638,17 @@ def command_loop() -> None:
 
                 if not text.startswith("/"):
                     continue
+
                 if chat_id != TELEGRAM_CHAT_ID:
+                    print(f"Ignored command from chat_id={chat_id}", flush=True)
                     continue
+
+                print(f"Received update_id={update_id}, text={text}", flush=True)
 
                 try:
                     handle_command(text)
                 except Exception as e:
+                    print(f"Command handler error: {e}", flush=True)
                     send_telegram_message(f"❌ Command error: <code>{esc_html(e)}</code>")
 
         except Exception as e:
@@ -702,8 +734,16 @@ def main() -> None:
     print(f"SYMBOL             : {SYMBOL}", flush=True)
     print(f"INTERVAL           : {INTERVAL}", flush=True)
     print(f"DEFAULT_RR         : {DEFAULT_RR}", flush=True)
+    print(f"MIN_STOP_DISTANCE  : {MIN_STOP_DISTANCE}", flush=True)
+    print(f"PRICE_BUFFER       : {PRICE_BUFFER}", flush=True)
+    print(f"LOOKBACK_BARS      : {LOOKBACK_BARS}", flush=True)
+    print(f"ENTRY_WAIT_BARS    : {ENTRY_WAIT_BARS}", flush=True)
+    print(f"MAX_HOLD_BARS      : {MAX_HOLD_BARS}", flush=True)
     print(f"CHECK_INTERVAL_SEC : {CHECK_INTERVAL_SECONDS}", flush=True)
     print(f"PORT               : {PORT}", flush=True)
+
+    # Drain old Telegram backlog so stale /stopbt or /resetbot do not run after restart
+    sync_update_offset_on_startup()
 
     t_web = threading.Thread(target=run_web_server, daemon=True)
     t_cmd = threading.Thread(target=command_loop, daemon=True)
