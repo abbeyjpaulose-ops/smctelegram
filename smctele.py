@@ -37,6 +37,12 @@ MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "180"))
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "30"))
 CONSERVATIVE_SAME_CANDLE = os.getenv("CONSERVATIVE_SAME_CANDLE", "true").lower() == "true"
 
+# Optional: disable Telegram command polling if you want to avoid getUpdates conflicts
+ENABLE_COMMAND_POLLING = os.getenv("ENABLE_COMMAND_POLLING", "true").lower() == "true"
+
+# Optional safety: if True, bot will not crash on Telegram send errors
+SAFE_TELEGRAM_SEND = os.getenv("SAFE_TELEGRAM_SEND", "true").lower() == "true"
+
 
 # =========================================================
 # RUNTIME STATE
@@ -47,8 +53,8 @@ BOT_STATE: Dict[str, Any] = {
     "enabled": False,
     "rr": DEFAULT_RR,
     "last_update_id": 0,
-    "signals": [],              # list[dict]
-    "seen_signal_ids": [],      # recent signal ids for duplicate blocking
+    "signals": [],          # list[dict]
+    "seen_signal_ids": [],  # recently seen ids to avoid duplicate alerting
 }
 
 
@@ -68,7 +74,7 @@ class ManagedSignal:
     tp: float
     risk: float
     expires_at: str
-    status: str = "pending"     # pending / active / win / loss / expired / timeout
+    status: str = "pending"      # pending / active / win / loss / expired / timeout
     sent_entry_alert: bool = False
     entry_time: Optional[str] = None
     exit_time: Optional[str] = None
@@ -95,7 +101,7 @@ def round5(x: float) -> float:
     return round(float(x), 5)
 
 
-def now_iso_utc() -> pd.Timestamp:
+def now_utc() -> pd.Timestamp:
     ts = pd.Timestamp.utcnow()
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
@@ -117,13 +123,26 @@ def fmt_ts(ts) -> str:
 
 def esc_html(s: Any) -> str:
     s = str(s)
-    return (
-        s.replace("&", "&amp;")
-         .replace("<", "&lt;")
-         .replace(">", "&gt;")
-    )
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def candle_body_high(row: pd.Series) -> float:
+    return max(float(row["open"]), float(row["close"]))
+
+
+def candle_body_low(row: pd.Series) -> float:
+    return min(float(row["open"]), float(row["close"]))
+
+
+def get_current_rr() -> float:
+    with state_lock:
+        rr = BOT_STATE.get("rr", DEFAULT_RR)
+    return rr if rr > 0 else DEFAULT_RR
+
+
+# =========================================================
+# TELEGRAM UTILS
+# =========================================================
 def send_telegram_message(text: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -134,7 +153,11 @@ def send_telegram_message(text: str) -> None:
     }
     r = requests.post(url, json=payload, timeout=30)
     if r.status_code != 200:
-        raise RuntimeError(f"Telegram send failed: {r.status_code} {r.text}")
+        msg = f"Telegram send failed: {r.status_code} {r.text}"
+        if SAFE_TELEGRAM_SEND:
+            print(msg, flush=True)
+            return
+        raise RuntimeError(msg)
 
 
 def get_updates(offset: Optional[int] = None, timeout: int = 20) -> Dict[str, Any]:
@@ -147,10 +170,18 @@ def get_updates(offset: Optional[int] = None, timeout: int = 20) -> Dict[str, An
     return r.json()
 
 
-def get_current_rr() -> float:
-    with state_lock:
-        rr = BOT_STATE.get("rr", DEFAULT_RR)
-    return rr if rr > 0 else DEFAULT_RR
+def print_webhook_info() -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    print("Webhook info:", r.json(), flush=True)
+
+
+def clear_webhook() -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    print("Webhook cleared:", r.json(), flush=True)
 
 
 # =========================================================
@@ -200,14 +231,6 @@ def get_twelvedata_candles(symbol: str, interval: str, outputsize: int) -> pd.Da
 # =========================================================
 # SMC LOGIC
 # =========================================================
-def candle_body_high(row: pd.Series) -> float:
-    return max(float(row["open"]), float(row["close"]))
-
-
-def candle_body_low(row: pd.Series) -> float:
-    return min(float(row["open"]), float(row["close"]))
-
-
 def build_confirmed_pivots(m1: pd.DataFrame, swing_window: int = 2) -> pd.DataFrame:
     df = m1.copy()
     n = swing_window
@@ -223,13 +246,8 @@ def build_confirmed_pivots(m1: pd.DataFrame, swing_window: int = 2) -> pd.DataFr
     df["pivot_high_confirmed_at"] = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns, UTC]")
     df["pivot_low_confirmed_at"] = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns, UTC]")
 
-    df["pivot_high_confirmed_at"] = (
-        df["timestamp"] + n * tf_delta
-    ).where(df["pivot_high"].notna(), pd.NaT)
-
-    df["pivot_low_confirmed_at"] = (
-        df["timestamp"] + n * tf_delta
-    ).where(df["pivot_low"].notna(), pd.NaT)
+    df["pivot_high_confirmed_at"] = (df["timestamp"] + n * tf_delta).where(df["pivot_high"].notna(), pd.NaT)
+    df["pivot_low_confirmed_at"] = (df["timestamp"] + n * tf_delta).where(df["pivot_low"].notna(), pd.NaT)
 
     return df
 
@@ -248,9 +266,8 @@ def get_ob_zone(ob_row: pd.Series, bullish: bool, use_body: bool = True):
 
 def detect_smc_signal_latest_closed(m1: pd.DataFrame) -> Optional[ManagedSignal]:
     """
-    Backtest-aligned logic:
-    use the latest available closed candle as signal candle.
-    This is the len(df)-1 version.
+    Backtest-aligned logic.
+    Uses latest available closed candle => len(df)-1
     """
     rr = get_current_rr()
     df = build_confirmed_pivots(m1, SMC_SWING_WINDOW).reset_index(drop=True)
@@ -277,7 +294,6 @@ def detect_smc_signal_latest_closed(m1: pd.DataFrame) -> Optional[ManagedSignal]
     last_lo = piv_lo.iloc[-1] if not piv_lo.empty else None
 
     direction = None
-
     if last_hi is not None and float(row["close"]) > float(last_hi["pivot_high"]):
         direction = "long"
     elif last_lo is not None and float(row["close"]) < float(last_lo["pivot_low"]):
@@ -296,6 +312,7 @@ def detect_smc_signal_latest_closed(m1: pd.DataFrame) -> Optional[ManagedSignal]
 
         ob = ob_candidates.iloc[-1]
         zone_low, zone_high, ob_extreme = get_ob_zone(ob, bullish=True, use_body=SMC_OB_USE_BODY)
+
         entry = (zone_low + zone_high) / 2.0
         sl = ob_extreme - PRICE_BUFFER
         if entry - sl < MIN_STOP_DISTANCE:
@@ -310,6 +327,7 @@ def detect_smc_signal_latest_closed(m1: pd.DataFrame) -> Optional[ManagedSignal]
 
         ob = ob_candidates.iloc[-1]
         zone_low, zone_high, ob_extreme = get_ob_zone(ob, bullish=False, use_body=SMC_OB_USE_BODY)
+
         entry = (zone_low + zone_high) / 2.0
         sl = ob_extreme + PRICE_BUFFER
         if sl - entry < MIN_STOP_DISTANCE:
@@ -376,13 +394,15 @@ def manage_all_signals(m1: pd.DataFrame) -> None:
         bos_time = pd.Timestamp(sig.bos_time)
         expires_at = pd.Timestamp(sig.expires_at)
 
-        # -------------------------------------------
-        # PENDING: look for entry after BOS candle
-        # -------------------------------------------
+        # ----------------------------------------
+        # PENDING -> look for entry
+        # ----------------------------------------
         if sig.status == "pending":
             entry_row = None
+
             for _, r in closed_df.iterrows():
                 ts = pd.Timestamp(r["timestamp"])
+
                 if ts <= bos_time:
                     continue
                 if ts > expires_at:
@@ -409,6 +429,7 @@ def manage_all_signals(m1: pd.DataFrame) -> None:
                         f"RR: <code>1:{esc_html(get_current_rr())}</code>"
                     )
                     sig.sent_entry_alert = True
+
             else:
                 last_closed_ts = pd.Timestamp(closed_df.iloc[-1]["timestamp"])
                 if last_closed_ts > expires_at:
@@ -421,26 +442,19 @@ def manage_all_signals(m1: pd.DataFrame) -> None:
                         "Entry was not triggered before expiry."
                     )
 
-        # -------------------------------------------
-        # ACTIVE: look for TP/SL/timeout
-        # -------------------------------------------
+        # ----------------------------------------
+        # ACTIVE -> look for TP / SL / timeout
+        # ----------------------------------------
         if sig.status == "active" and sig.entry_time:
             entry_time = pd.Timestamp(sig.entry_time)
             active_rows = closed_df[closed_df["timestamp"] >= entry_time].copy()
 
             for _, r in active_rows.iterrows():
                 ts = pd.Timestamp(r["timestamp"])
-
-                # Count bars only from entry onward
-                if ts < entry_time:
-                    continue
-
-                # Rebuild bars held based on unique rows from entry
-                # simpler and safer for repeated loop calls
-                sig.bars_held = int((active_rows[active_rows["timestamp"] <= ts]).shape[0])
-
                 hi = float(r["high"])
                 lo = float(r["low"])
+
+                sig.bars_held = int((active_rows[active_rows["timestamp"] <= ts]).shape[0])
 
                 if sig.direction == "long":
                     hit_sl = lo <= sig.sl
@@ -507,15 +521,18 @@ def manage_all_signals(m1: pd.DataFrame) -> None:
 
         updated.append(asdict(sig))
 
-    # keep recent signals only
-    keep = []
+    # Keep active/pending items + recent completed items
+    keep: List[Dict[str, Any]] = []
+    current_now = now_utc()
+
     for s in updated:
         status = s.get("status")
         if status in {"win", "loss", "expired", "timeout"}:
-            exit_or_bos = s.get("exit_time") or s.get("bos_time")
-            ts = pd.Timestamp(exit_or_bos)
-            if now_iso_utc() - ts <= pd.Timedelta(days=3):
-                keep.append(s)
+            ref_ts = s.get("exit_time") or s.get("bos_time")
+            if ref_ts is not None:
+                ts = pd.Timestamp(ref_ts)
+                if current_now - ts <= pd.Timedelta(days=3):
+                    keep.append(s)
         else:
             keep.append(s)
 
@@ -524,7 +541,7 @@ def manage_all_signals(m1: pd.DataFrame) -> None:
 
 
 # =========================================================
-# BOT STATUS
+# STATUS
 # =========================================================
 def get_status_text() -> str:
     with state_lock:
@@ -534,6 +551,10 @@ def get_status_text() -> str:
 
     pending_count = sum(1 for s in signals if s.get("status") == "pending")
     active_count = sum(1 for s in signals if s.get("status") == "active")
+    win_count = sum(1 for s in signals if s.get("status") == "win")
+    loss_count = sum(1 for s in signals if s.get("status") == "loss")
+    expired_count = sum(1 for s in signals if s.get("status") == "expired")
+    timeout_count = sum(1 for s in signals if s.get("status") == "timeout")
 
     return (
         "📊 <b>SMC bot status</b>\n"
@@ -542,7 +563,12 @@ def get_status_text() -> str:
         f"Min SL distance: <code>&gt;{esc_html(MIN_STOP_DISTANCE)}</code>\n"
         f"Pending signals: <code>{esc_html(pending_count)}</code>\n"
         f"Active trades: <code>{esc_html(active_count)}</code>\n"
-        f"Tracked items: <code>{esc_html(len(signals))}</code>"
+        f"Wins tracked: <code>{esc_html(win_count)}</code>\n"
+        f"Losses tracked: <code>{esc_html(loss_count)}</code>\n"
+        f"Expired tracked: <code>{esc_html(expired_count)}</code>\n"
+        f"Timeout tracked: <code>{esc_html(timeout_count)}</code>\n"
+        f"Tracked items: <code>{esc_html(len(signals))}</code>\n"
+        f"Command polling: <code>{esc_html(ENABLE_COMMAND_POLLING)}</code>"
     )
 
 
@@ -573,6 +599,7 @@ def handle_command(text: str) -> None:
         if len(parts) < 2:
             send_telegram_message("Usage: <code>/setrr 3</code>")
             return
+
         try:
             rr = float(parts[1])
             if rr <= 0:
@@ -596,6 +623,7 @@ def handle_command(text: str) -> None:
             BOT_STATE["rr"] = DEFAULT_RR
             BOT_STATE["signals"] = []
             BOT_STATE["seen_signal_ids"] = []
+            BOT_STATE["last_update_id"] = 0
         send_telegram_message("♻️ <b>Bot state cleared.</b>")
         return
 
@@ -612,7 +640,7 @@ def handle_command(text: str) -> None:
 
 
 # =========================================================
-# TELEGRAM POLLING LOOP
+# TELEGRAM COMMAND LOOP
 # =========================================================
 def command_loop() -> None:
     print("Telegram command loop started", flush=True)
@@ -639,7 +667,6 @@ def command_loop() -> None:
 
                 if not text.startswith("/"):
                     continue
-
                 if chat_id != TELEGRAM_CHAT_ID:
                     continue
 
@@ -647,6 +674,18 @@ def command_loop() -> None:
                     handle_command(text)
                 except Exception as e:
                     send_telegram_message(f"❌ Command error: <code>{esc_html(e)}</code>")
+
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            body = e.response.text if e.response is not None else str(e)
+
+            if status == 409:
+                print("409 conflict: another polling process is using this bot token.", flush=True)
+                print("Fix: stop all duplicate bot instances or set ENABLE_COMMAND_POLLING=false.", flush=True)
+            else:
+                print(f"Command loop HTTP error: {status} {body}", flush=True)
+
+            time.sleep(5)
 
         except Exception as e:
             print(f"Command loop error: {e}", flush=True)
@@ -673,11 +712,12 @@ def signal_loop() -> None:
                 time.sleep(CHECK_INTERVAL_SECONDS)
                 continue
 
-            # 1) manage all existing signals independently
+            # 1) manage all existing signals
             manage_all_signals(m1)
 
-            # 2) detect latest signal using latest closed candle logic
+            # 2) detect latest closed-candle signal
             signal = detect_smc_signal_latest_closed(m1)
+
             if signal is not None:
                 with state_lock:
                     seen = set(BOT_STATE.get("seen_signal_ids", []))
@@ -686,9 +726,7 @@ def signal_loop() -> None:
                     if signal.signal_id not in seen and signal.signal_id not in existing_ids:
                         BOT_STATE["signals"].append(asdict(signal))
                         BOT_STATE["seen_signal_ids"].append(signal.signal_id)
-
-                        # trim seen ids
-                        BOT_STATE["seen_signal_ids"] = BOT_STATE["seen_signal_ids"][-1000:]
+                        BOT_STATE["seen_signal_ids"] = BOT_STATE["seen_signal_ids"][-2000:]
 
                         send_telegram_message(
                             "🚨 <b>LIVE SIGNAL DETECTED — XAUUSD SMC</b>\n"
@@ -730,17 +768,27 @@ def main() -> None:
     print(f"ENTRY_WAIT_BARS       : {ENTRY_WAIT_BARS}", flush=True)
     print(f"MAX_HOLD_BARS         : {MAX_HOLD_BARS}", flush=True)
     print(f"CHECK_INTERVAL_SEC    : {CHECK_INTERVAL_SECONDS}", flush=True)
+    print(f"ENABLE_COMMAND_POLLING: {ENABLE_COMMAND_POLLING}", flush=True)
 
-    t1 = threading.Thread(target=command_loop, daemon=True)
+    # Important for polling mode
+    print_webhook_info()
+    clear_webhook()
+    print_webhook_info()
+
+    if ENABLE_COMMAND_POLLING:
+        t1 = threading.Thread(target=command_loop, daemon=True)
+        t1.start()
+    else:
+        print("Command polling disabled. Use env ENABLE_COMMAND_POLLING=true to enable.", flush=True)
+
     t2 = threading.Thread(target=signal_loop, daemon=True)
-
-    t1.start()
     t2.start()
 
     send_telegram_message(
         "✅ <b>XAUUSD SMC bot is online.</b>\n"
-        "Logic aligned toward backtest-style latest closed candle.\n"
-        "Multiple signals/trades are allowed and tracked separately.\n"
+        f"Command polling: <code>{esc_html(ENABLE_COMMAND_POLLING)}</code>\n"
+        "Logic aligned to latest closed candle.\n"
+        "Multiple signals and multiple trades are tracked separately.\n"
         "Use <code>/startbt</code> to begin scanning."
     )
 
