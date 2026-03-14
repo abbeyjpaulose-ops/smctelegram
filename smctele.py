@@ -38,17 +38,20 @@ MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "180"))
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "30"))
 CONSERVATIVE_SAME_CANDLE = os.getenv("CONSERVATIVE_SAME_CANDLE", "true").lower() == "true"
 
-# IMPORTANT:
-# Keep this TRUE if you want Telegram commands to work
+# Keep TRUE if you want /startbt /statusbt etc.
 ENABLE_COMMAND_POLLING = os.getenv("ENABLE_COMMAND_POLLING", "true").lower() == "true"
 
+# Safe send avoids crash if Telegram rejects one message
 SAFE_TELEGRAM_SEND = os.getenv("SAFE_TELEGRAM_SEND", "true").lower() == "true"
+
+# Optional: auto start scanning immediately on boot
+AUTO_START_ENABLED = os.getenv("AUTO_START_ENABLED", "false").lower() == "true"
 
 PORT = int(os.getenv("PORT", "10000"))
 
 
 # =========================================================
-# FLASK APP FOR RENDER
+# FLASK APP FOR RENDER WEB SERVICE
 # =========================================================
 app = Flask(__name__)
 
@@ -231,8 +234,15 @@ def send_startup_message_once() -> None:
     send_telegram_message(
         "✅ <b>XAUUSD SMC bot is online.</b>\n"
         f"Command polling: <code>{esc_html(ENABLE_COMMAND_POLLING)}</code>\n"
+        f"Auto start enabled: <code>{esc_html(AUTO_START_ENABLED)}</code>\n"
         "Multiple signals and trades are tracked separately.\n"
-        "Use <code>/startbt</code> to begin scanning."
+        "Commands:\n"
+        "<code>/startbt</code>\n"
+        "<code>/stopbt</code>\n"
+        "<code>/statusbt</code>\n"
+        "<code>/setrr 3</code>\n"
+        "<code>/testmsg</code>\n"
+        "<code>/resetbot</code>"
     )
 
 
@@ -277,8 +287,7 @@ def get_twelvedata_candles(symbol: str, interval: str, outputsize: int) -> pd.Da
             "close": float(v["close"]),
         })
 
-    df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
-    return df
+    return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
 
 
 # =========================================================
@@ -326,7 +335,7 @@ def detect_smc_signal_latest_closed(m1: pd.DataFrame) -> Optional[ManagedSignal]
     rr = get_current_rr()
     df = build_confirmed_pivots(m1, SMC_SWING_WINDOW).reset_index(drop=True)
 
-    # Backtest-aligned logic: latest available closed candle
+    # Backtest-aligned logic
     i = len(df) - 1
     if i < max(10, SMC_SWING_WINDOW * 2 + 2):
         return None
@@ -450,9 +459,6 @@ def manage_all_signals(m1: pd.DataFrame) -> None:
         bos_time = pd.Timestamp(sig.bos_time)
         expires_at = pd.Timestamp(sig.expires_at)
 
-        # ----------------------------------------
-        # pending -> look for entry
-        # ----------------------------------------
         if sig.status == "pending":
             entry_row = None
 
@@ -491,7 +497,6 @@ def manage_all_signals(m1: pd.DataFrame) -> None:
                 if last_closed_ts > expires_at:
                     sig.status = "expired"
                     sig.pnl_points = 0.0
-
                     send_telegram_message(
                         "⌛ <b>Signal expired</b>\n"
                         f"Signal ID: <code>{esc_html(sig.signal_id)}</code>\n"
@@ -499,9 +504,6 @@ def manage_all_signals(m1: pd.DataFrame) -> None:
                         "Entry was not triggered before expiry."
                     )
 
-        # ----------------------------------------
-        # active -> look for result
-        # ----------------------------------------
         if sig.status == "active" and sig.entry_time:
             entry_time = pd.Timestamp(sig.entry_time)
             active_rows = closed_df[closed_df["timestamp"] >= entry_time].copy()
@@ -567,7 +569,6 @@ def manage_all_signals(m1: pd.DataFrame) -> None:
                     sig.status = "timeout"
                     sig.exit_time = ts.isoformat()
                     sig.pnl_points = 0.0
-
                     send_telegram_message(
                         "⌛ <b>Trade timeout — XAUUSD SMC</b>\n"
                         f"Signal ID: <code>{esc_html(sig.signal_id)}</code>\n"
@@ -624,12 +625,14 @@ def get_status_text() -> str:
         f"Expired tracked: <code>{esc_html(expired_count)}</code>\n"
         f"Timeout tracked: <code>{esc_html(timeout_count)}</code>\n"
         f"Tracked items: <code>{esc_html(len(signals))}</code>\n"
-        f"Command polling: <code>{esc_html(ENABLE_COMMAND_POLLING)}</code>"
+        f"Command polling: <code>{esc_html(ENABLE_COMMAND_POLLING)}</code>\n"
+        f"Auto start enabled: <code>{esc_html(AUTO_START_ENABLED)}</code>"
     )
 
 
 def handle_command(text: str) -> None:
-    cmd = text.strip().split()[0].lower()
+    first_token = text.strip().split()[0].lower()
+    cmd = first_token.split("@")[0]   # handles /statusbt@BotName
 
     if cmd == "/startbt":
         with state_lock:
@@ -718,9 +721,17 @@ def command_loop() -> None:
                 chat_id = str((msg.get("chat") or {}).get("id", ""))
                 text = str(msg.get("text", "")).strip()
 
+                print(f"Incoming update | chat_id={chat_id} | text={text}", flush=True)
+
                 if not text.startswith("/"):
                     continue
+
                 if chat_id != TELEGRAM_CHAT_ID:
+                    print(
+                        f"Ignored command due to TELEGRAM_CHAT_ID mismatch. "
+                        f"Expected={TELEGRAM_CHAT_ID} Got={chat_id}",
+                        flush=True
+                    )
                     continue
 
                 try:
@@ -821,10 +832,17 @@ def main() -> None:
     print(f"MAX_HOLD_BARS          : {MAX_HOLD_BARS}", flush=True)
     print(f"CHECK_INTERVAL_SECONDS : {CHECK_INTERVAL_SECONDS}", flush=True)
     print(f"ENABLE_COMMAND_POLLING : {ENABLE_COMMAND_POLLING}", flush=True)
+    print(f"AUTO_START_ENABLED     : {AUTO_START_ENABLED}", flush=True)
+    print(f"TELEGRAM_CHAT_ID       : {TELEGRAM_CHAT_ID}", flush=True)
 
     print_webhook_info()
     clear_webhook()
     print_webhook_info()
+
+    if AUTO_START_ENABLED:
+        with state_lock:
+            BOT_STATE["enabled"] = True
+        print("Auto start enabled: scanning starts immediately.", flush=True)
 
     if ENABLE_COMMAND_POLLING:
         t1 = threading.Thread(target=command_loop, daemon=True)
