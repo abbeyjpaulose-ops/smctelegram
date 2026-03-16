@@ -13,7 +13,7 @@ from flask import Flask, jsonify
 # CONFIG FROM ENV
 # =========================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()  # can be left blank for auto-detect
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
 SYMBOL = os.getenv("SYMBOL", "XAU/USD")
@@ -34,8 +34,9 @@ MAX_TRADE_BARS = int(os.getenv("MAX_TRADE_BARS", "180"))
 POLL_SLEEP_SECONDS = int(os.getenv("POLL_SLEEP_SECONDS", "2"))
 SIGNAL_CHECK_SECONDS = int(os.getenv("SIGNAL_CHECK_SECONDS", "60"))
 
-AUTO_START_BOT = os.getenv("AUTO_START_BOT", "false").strip().lower() == "true"
-AUTO_CAPTURE_CHAT_ID = os.getenv("AUTO_CAPTURE_CHAT_ID", "true").strip().lower() == "true"
+AUTO_START_BOT = os.getenv("AUTO_START_BOT", "true").strip().lower() == "true"
+AUTO_CAPTURE_CHAT_ID = os.getenv("AUTO_CAPTURE_CHAT_ID", "false").strip().lower() == "true"
+SEND_RESTART_MESSAGE = os.getenv("SEND_RESTART_MESSAGE", "true").strip().lower() == "true"
 
 # =========================================
 # SIMPLE STATE
@@ -47,10 +48,14 @@ state: Dict[str, Any] = {
     "last_signal_id": None,
     "pending_signal": None,
     "telegram_offset": 0,
-    "last_checked_ts": 0.0,
     "detected_chat_id": TELEGRAM_CHAT_ID if TELEGRAM_CHAT_ID else None,
     "startup_time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+    "last_candle_fetch_count": 0,
+    "last_closed_candle": None,
+    "last_signal_scan_time_utc": None,
+    "last_error": None,
 }
+
 
 # =========================================
 # APP
@@ -85,12 +90,69 @@ def health():
             "last_signal_id": state["last_signal_id"],
             "telegram_offset": state["telegram_offset"],
             "detected_chat_id": state["detected_chat_id"],
+            "last_candle_fetch_count": state["last_candle_fetch_count"],
+            "last_closed_candle": state["last_closed_candle"],
+            "last_signal_scan_time_utc": state["last_signal_scan_time_utc"],
+            "last_error": state["last_error"],
         })
 
 
 @app.get("/ping")
 def ping():
     return jsonify({"ok": True, "message": "pong"})
+
+
+@app.get("/debug/state")
+def debug_state():
+    with state_lock:
+        return jsonify({
+            "ok": True,
+            "state": state
+        })
+
+
+@app.get("/debug/candles")
+def debug_candles():
+    try:
+        rows = get_twelvedata_candles(SYMBOL, INTERVAL, 5)
+        return jsonify({
+            "ok": True,
+            "symbol": SYMBOL,
+            "interval": INTERVAL,
+            "count": len(rows),
+            "latest": asdict(rows[-1]) if rows else None,
+            "previous": asdict(rows[-2]) if len(rows) >= 2 else None,
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+        }), 500
+
+
+@app.get("/debug/signal")
+def debug_signal():
+    try:
+        rows = get_twelvedata_candles(SYMBOL, INTERVAL, LOOKBACK_BARS)
+        with state_lock:
+            rr = float(state["rr"])
+            enabled = state["bot_enabled"]
+        signal = detect_smc_signal(rows, rr)
+        return jsonify({
+            "ok": True,
+            "symbol": SYMBOL,
+            "interval": INTERVAL,
+            "rows": len(rows),
+            "bot_enabled": enabled,
+            "signal_found": signal is not None,
+            "signal": asdict(signal) if signal else None,
+            "last_closed_candle": asdict(rows[-2]) if len(rows) >= 2 else None,
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+        }), 500
 
 
 # =========================================
@@ -126,6 +188,11 @@ class Signal:
 # =========================================
 # HELPERS
 # =========================================
+def set_last_error(msg: str) -> None:
+    with state_lock:
+        state["last_error"] = msg
+
+
 def require_env() -> None:
     missing = []
     if not TELEGRAM_BOT_TOKEN:
@@ -147,8 +214,11 @@ def parse_twelvedata_datetime_utc(dt_str: str) -> float:
 
 def get_effective_chat_id() -> Optional[str]:
     with state_lock:
-        detected = state.get("detected_chat_id")
-    return detected or None
+        return state.get("detected_chat_id")
+
+
+def now_utc_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 # =========================================
@@ -180,7 +250,7 @@ def clear_telegram_webhook() -> None:
 def send_telegram_message(text: str) -> None:
     chat_id = get_effective_chat_id()
     if not chat_id:
-        print("[bot] send skipped: no TELEGRAM_CHAT_ID set and no chat auto-detected yet")
+        print("[bot] send skipped: no chat_id available")
         return
 
     payload = {
@@ -188,12 +258,14 @@ def send_telegram_message(text: str) -> None:
         "text": text,
         "parse_mode": "Markdown",
     }
-    print(f"[bot] sending message to chat_id={chat_id}: {text[:120]!r}")
+
     try:
+        print(f"[bot] sending message to {chat_id}: {text[:100]!r}")
         tg_api("sendMessage", payload, timeout=20)
         print("[bot] message sent successfully")
     except Exception as e:
-        print(f"[Telegram send error] {e}")
+        print(f"[bot] Telegram send error: {e}")
+        set_last_error(f"Telegram send error: {e}")
 
 
 def get_updates(offset: int) -> List[dict]:
@@ -415,6 +487,7 @@ def manage_pending_trade(rows: List[Candle]) -> None:
 
                 with state_lock:
                     state["pending_signal"] = asdict(sig)
+
                 print(f"[bot] Trade activated: {sig.signal_id}")
                 break
 
@@ -426,13 +499,12 @@ def manage_pending_trade(rows: List[Candle]) -> None:
                     f"Direction: *{sig.direction.upper()}*\n"
                     "Entry was not triggered before expiry."
                 )
-                print(f"[bot] Signal expired: {sig.signal_id}")
                 with state_lock:
                     state["pending_signal"] = None
+                print(f"[bot] Signal expired: {sig.signal_id}")
             return
 
     bars_from_entry = 0
-
     for r in rows:
         if not sig.entry_time:
             continue
@@ -444,7 +516,6 @@ def manage_pending_trade(rows: List[Candle]) -> None:
         if sig.direction == "long":
             hit_sl = r.low <= sig.sl
             hit_tp = r.high >= sig.tp
-
             if hit_sl or hit_tp:
                 outcome = "loss" if hit_sl else "win"
                 pnl = round5((sig.entry - sig.sl) if hit_sl else (sig.tp - sig.entry))
@@ -459,14 +530,13 @@ def manage_pending_trade(rows: List[Candle]) -> None:
                     f"Outcome: *{outcome.upper()}*\n"
                     f"PnL points: `{pnl}`"
                 )
-                print(f"[bot] Trade closed: {sig.signal_id}, outcome={outcome}")
                 with state_lock:
                     state["pending_signal"] = None
+                print(f"[bot] Trade closed: {sig.signal_id}, outcome={outcome}")
                 return
         else:
             hit_sl = r.high >= sig.sl
             hit_tp = r.low <= sig.tp
-
             if hit_sl or hit_tp:
                 outcome = "loss" if hit_sl else "win"
                 pnl = round5((sig.sl - sig.entry) if hit_sl else (sig.entry - sig.tp))
@@ -481,9 +551,9 @@ def manage_pending_trade(rows: List[Candle]) -> None:
                     f"Outcome: *{outcome.upper()}*\n"
                     f"PnL points: `{pnl}`"
                 )
-                print(f"[bot] Trade closed: {sig.signal_id}, outcome={outcome}")
                 with state_lock:
                     state["pending_signal"] = None
+                print(f"[bot] Trade closed: {sig.signal_id}, outcome={outcome}")
                 return
 
         if bars_from_entry >= MAX_TRADE_BARS:
@@ -492,9 +562,9 @@ def manage_pending_trade(rows: List[Candle]) -> None:
                 f"Direction: *{sig.direction.upper()}*\n"
                 "Trade closed due to max holding bars without TP/SL hit."
             )
-            print(f"[bot] Trade timeout: {sig.signal_id}")
             with state_lock:
                 state["pending_signal"] = None
+            print(f"[bot] Trade timeout: {sig.signal_id}")
             return
 
 
@@ -508,6 +578,8 @@ def get_status_text() -> str:
         pending = state["pending_signal"]
         last_signal_id = state["last_signal_id"]
         detected_chat_id = state["detected_chat_id"]
+        last_fetch = state["last_candle_fetch_count"]
+        last_closed = state["last_closed_candle"]
 
     active_trade = False
     pending_signal = False
@@ -522,8 +594,10 @@ def get_status_text() -> str:
         f"Min SL distance: `>{MIN_SL_DISTANCE}`\n"
         f"Pending signal: `{pending_signal}`\n"
         f"Active trade: `{active_trade}`\n"
-        f"Detected Chat ID: `{detected_chat_id or 'not set yet'}`\n"
-        f"Last signal ID: `{last_signal_id or 'none'}`"
+        f"Detected Chat ID: `{detected_chat_id or 'not set'}`\n"
+        f"Last signal ID: `{last_signal_id or 'none'}`\n"
+        f"Last candle fetch count: `{last_fetch}`\n"
+        f"Last closed candle: `{last_closed or 'none'}`"
     )
 
 
@@ -531,7 +605,7 @@ def handle_command(text: str) -> None:
     parts = text.strip().split()
     command = parts[0].lower().split("@")[0]
 
-    print(f"[bot] command received: {command}, full text: {text!r}")
+    print(f"[bot] command received: {command} | text={text!r}")
 
     if command == "/startbt":
         with state_lock:
@@ -609,10 +683,13 @@ def telegram_poll_loop() -> None:
     print("[bot] Telegram polling loop started")
     while True:
         try:
+            print("[bot] telegram loop heartbeat")
+
             with state_lock:
                 offset = int(state["telegram_offset"])
 
             updates = get_updates(offset)
+
             if updates:
                 print(f"[bot] updates count = {len(updates)}")
 
@@ -628,16 +705,16 @@ def telegram_poll_loop() -> None:
                 chat_id = str(chat.get("id", ""))
                 text = str(msg.get("text", "")).strip()
 
-                print(f"[bot] incoming chat_id={chat_id}, configured_chat_id={TELEGRAM_CHAT_ID}, detected_chat_id={get_effective_chat_id()}, text={text!r}")
+                print(f"[bot] incoming chat_id={chat_id}, expected_chat_id={get_effective_chat_id()}, text={text!r}")
 
                 if AUTO_CAPTURE_CHAT_ID and not get_effective_chat_id() and chat_id:
                     with state_lock:
                         state["detected_chat_id"] = chat_id
-                    print(f"[bot] auto-detected TELEGRAM_CHAT_ID = {chat_id}")
+                    print(f"[bot] auto-detected TELEGRAM_CHAT_ID={chat_id}")
 
                 effective_chat_id = get_effective_chat_id()
                 if effective_chat_id and chat_id != effective_chat_id:
-                    print(f"[bot] ignored message from different chat_id={chat_id}")
+                    print(f"[bot] ignored message from other chat_id={chat_id}")
                     continue
 
                 if not text.startswith("/"):
@@ -647,7 +724,9 @@ def telegram_poll_loop() -> None:
                 handle_command(text)
 
         except Exception as e:
-            print(f"[bot] Telegram polling error: {e}")
+            err = f"Telegram polling error: {e}"
+            print(f"[bot] {err}")
+            set_last_error(err)
 
         time.sleep(POLL_SLEEP_SECONDS)
 
@@ -655,17 +734,33 @@ def telegram_poll_loop() -> None:
 def signal_loop() -> None:
     print("[bot] Signal loop started")
     if AUTO_START_BOT:
-        print("[bot] AUTO_START_BOT=true, trading loop enabled immediately after deploy")
+        print("[bot] AUTO_START_BOT=true, signal scanning enabled at startup")
 
     while True:
         try:
+            print("[bot] signal loop heartbeat")
+
             with state_lock:
                 enabled = state["bot_enabled"]
                 rr = float(state["rr"])
 
             if enabled:
+                print("[bot] signal scan started")
                 rows = get_twelvedata_candles(SYMBOL, INTERVAL, LOOKBACK_BARS)
+
+                with state_lock:
+                    state["last_candle_fetch_count"] = len(rows)
+                    state["last_signal_scan_time_utc"] = now_utc_str()
+                    if len(rows) >= 2:
+                        state["last_closed_candle"] = asdict(rows[-2])
+
                 print(f"[bot] fetched {len(rows)} candles")
+                if len(rows) >= 2:
+                    r = rows[-2]
+                    print(
+                        f"[bot] latest closed candle: ts={r.timestamp}, "
+                        f"o={r.open}, h={r.high}, l={r.low}, c={r.close}"
+                    )
 
                 if len(rows) >= 30:
                     manage_pending_trade(rows)
@@ -701,9 +796,13 @@ def signal_loop() -> None:
                                 print(f"[bot] Duplicate signal ignored: {signal.signal_id}")
                         else:
                             print("[bot] No new signal on this cycle")
+            else:
+                print("[bot] bot_enabled is false, signal scan skipped")
 
         except Exception as e:
-            print(f"[bot] Signal loop error: {e}")
+            err = f"Signal loop error: {e}"
+            print(f"[bot] {err}")
+            set_last_error(err)
 
         time.sleep(SIGNAL_CHECK_SECONDS)
 
@@ -723,10 +822,13 @@ require_env()
 clear_telegram_webhook()
 start_background_threads()
 
+if SEND_RESTART_MESSAGE and TELEGRAM_CHAT_ID:
+    send_telegram_message("✅ XAUUSD SMC bot restarted on Render and background loops started.")
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     print(f"[bot] Starting Flask app on port {port}")
     print(f"[bot] AUTO_START_BOT={AUTO_START_BOT}")
     print(f"[bot] AUTO_CAPTURE_CHAT_ID={AUTO_CAPTURE_CHAT_ID}")
-    print(f"[bot] Initial TELEGRAM_CHAT_ID={TELEGRAM_CHAT_ID or 'not provided'}")
+    print(f"[bot] TELEGRAM_CHAT_ID={TELEGRAM_CHAT_ID or 'not provided'}")
     app.run(host="0.0.0.0", port=port)
