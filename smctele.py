@@ -1,759 +1,715 @@
-from __future__ import annotations
-
 import os
-import json
 import time
-import math
+import json
 import threading
 from dataclasses import dataclass, asdict
-from typing import Optional, Dict, Any, List, Tuple
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timezone
 
-import pandas as pd
 import requests
 from flask import Flask, jsonify
 
-# =========================================================
-# ENV / CONFIG
-# =========================================================
+# =========================================
+# CONFIG FROM ENV
+# =========================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
-
-# Optional fixed chat id. If empty, first /startbot chat will be stored in state.
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
-SYMBOL = os.getenv("SYMBOL", "XAU/USD").strip()
-INPUT_TIMEZONE = os.getenv("INPUT_TIMEZONE", "UTC").strip()
-OUTPUT_TIMEZONE = os.getenv("OUTPUT_TIMEZONE", "Asia/Kolkata").strip()
+SYMBOL = os.getenv("SYMBOL", "XAU/USD")
+INTERVAL = os.getenv("INTERVAL", "1min")
+SOURCE_TIMEZONE = os.getenv("SOURCE_TIMEZONE", "UTC")
+OUTPUT_TIMEZONE = os.getenv("OUTPUT_TIMEZONE", "Asia/Kolkata")
 
-RR = float(os.getenv("RR", "2.0"))
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "20"))
-PORT = int(os.getenv("PORT", "10000"))
+DEFAULT_RR = float(os.getenv("DEFAULT_RR", "2.0"))
+MIN_SL_DISTANCE = float(os.getenv("MIN_SL_DISTANCE", "0.20"))
+SL_BUFFER = float(os.getenv("SL_BUFFER", "0.03"))
 
-# SMC logic
-SMC_ENTRY_TF = "15min"
-SMC_SWING_WINDOW = int(os.getenv("SMC_SWING_WINDOW", "2"))
-SMC_OB_SEARCH_BACK = int(os.getenv("SMC_OB_SEARCH_BACK", "8"))
-SMC_OB_USE_BODY = os.getenv("SMC_OB_USE_BODY", "true").strip().lower() == "true"
+LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "300"))
+SWING_WINDOW = int(os.getenv("SWING_WINDOW", "2"))
+OB_LOOKBACK = int(os.getenv("OB_LOOKBACK", "8"))
+ENTRY_WAIT_BARS = int(os.getenv("ENTRY_WAIT_BARS", "20"))
+MAX_TRADE_BARS = int(os.getenv("MAX_TRADE_BARS", "180"))
 
-ENTRY_WAIT_BARS_SMC = int(os.getenv("ENTRY_WAIT_BARS_SMC", "180"))   # 180 x 1min = 3h
-MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", str(24 * 60)))        # 24h
-MIN_STOP_DISTANCE = float(os.getenv("MIN_STOP_DISTANCE", "0.20"))
-PRICE_BUFFER = float(os.getenv("PRICE_BUFFER", "0.05"))
-MIN_SL_FILTER = float(os.getenv("MIN_SL_FILTER", "0.49"))
-ONE_TRADE_AT_A_TIME = os.getenv("ONE_TRADE_AT_A_TIME", "true").strip().lower() == "true"
-CONSERVATIVE_SAME_CANDLE = os.getenv("CONSERVATIVE_SAME_CANDLE", "true").strip().lower() == "true"
+POLL_SLEEP_SECONDS = int(os.getenv("POLL_SLEEP_SECONDS", "2"))
+SIGNAL_CHECK_SECONDS = int(os.getenv("SIGNAL_CHECK_SECONDS", "60"))
 
-# Data fetch sizes
-TD_OUTPUTSIZE_1M = int(os.getenv("TD_OUTPUTSIZE_1M", "2000"))
-TD_OUTPUTSIZE_15M = int(os.getenv("TD_OUTPUTSIZE_15M", "500"))
+# =========================================
+# SIMPLE STATE
+# =========================================
+state_lock = threading.Lock()
+state: Dict[str, Any] = {
+    "bot_enabled": False,
+    "rr": DEFAULT_RR,
+    "last_signal_id": None,
+    "pending_signal": None,
+    "telegram_offset": 0,
+    "last_checked_ts": 0.0,
+}
 
-STATE_PATH = os.getenv("STATE_PATH", "bot_state.json")
-
-# =========================================================
-# VALIDATION
-# =========================================================
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
-if not TWELVEDATA_API_KEY:
-    raise RuntimeError("Missing TWELVEDATA_API_KEY")
-
-
-# =========================================================
-# FLASK APP FOR RENDER HEALTH
-# =========================================================
+# =========================================
+# APP
+# =========================================
 app = Flask(__name__)
 
 
 @app.get("/")
 def home():
-    return jsonify({"ok": True, "service": "xauusd_smc_bot"})
+    with state_lock:
+        return jsonify({
+            "ok": True,
+            "service": "xauusd_smc_bot",
+            "bot_enabled": state["bot_enabled"],
+            "rr": state["rr"],
+            "has_pending_signal": state["pending_signal"] is not None,
+            "last_signal_id": state["last_signal_id"],
+        })
 
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "xauusd_smc_bot"})
+    with state_lock:
+        return jsonify({
+            "ok": True,
+            "service": "xauusd_smc_bot",
+            "bot_enabled": state["bot_enabled"],
+            "rr": state["rr"],
+            "pending_signal": state["pending_signal"] is not None,
+            "last_signal_id": state["last_signal_id"],
+            "telegram_offset": state["telegram_offset"],
+        })
 
 
-# =========================================================
-# TELEGRAM HELPERS
-# =========================================================
-TG_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+# =========================================
+# DATA MODELS
+# =========================================
+@dataclass
+class Candle:
+    timestamp: str
+    open: float
+    high: float
+    low: float
+    close: float
 
 
+@dataclass
+class Signal:
+    signal_id: str
+    direction: str
+    bos_time: str
+    ob_time: str
+    zone_low: float
+    zone_high: float
+    entry: float
+    sl: float
+    tp: float
+    risk: float
+    expires_at_epoch: float
+    sent_entry_alert: bool
+    is_active_trade: bool
+    entry_time: Optional[str]
+
+
+# =========================================
+# HELPERS
+# =========================================
+def require_env() -> None:
+    missing = []
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
+    if not TWELVE_DATA_API_KEY:
+        missing.append("TWELVE_DATA_API_KEY")
+    if missing:
+        raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
+
+
+def round5(x: float) -> float:
+    return round(float(x), 5)
+
+
+def parse_twelvedata_datetime_utc(dt_str: str) -> float:
+    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def format_epoch_local(epoch_sec: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(epoch_sec)) + f" {OUTPUT_TIMEZONE}"
+
+
+# =========================================
+# TELEGRAM
+# =========================================
 def tg_api(method: str, payload: Optional[dict] = None, timeout: int = 30) -> dict:
-    url = f"{TG_BASE}/{method}"
-    resp = requests.post(url, data=payload or {}, timeout=timeout)
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    resp = requests.post(url, json=payload or {}, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
-    if not data.get("ok", False):
+    if not data.get("ok"):
         raise RuntimeError(f"Telegram API error: {data}")
     return data
 
 
-def telegram_delete_webhook():
-    try:
-        tg_api("deleteWebhook", {"drop_pending_updates": False}, timeout=30)
-    except Exception as e:
-        print(f"deleteWebhook warning: {e}", flush=True)
+def clear_telegram_webhook() -> None:
+    """
+    Important fix for 409 Conflict:
+    If a webhook exists, getUpdates polling will conflict.
+    """
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
+    resp = requests.post(url, json={"drop_pending_updates": False}, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    print("[bot] deleteWebhook response:", data)
+
+    # Optional visibility
+    info_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo"
+    info_resp = requests.get(info_url, timeout=20)
+    info_resp.raise_for_status()
+    print("[bot] getWebhookInfo:", info_resp.json())
 
 
-def send_telegram_message(text: str, chat_id: Optional[str]) -> None:
-    if not chat_id:
-        print("send_telegram_message skipped: no chat_id configured yet.", flush=True)
-        return
-    try:
-        tg_api("sendMessage", {"chat_id": str(chat_id), "text": text}, timeout=30)
-    except Exception as e:
-        print(f"sendMessage error: {e}", flush=True)
-
-
-def get_updates(offset: Optional[int], timeout_sec: int = 25) -> List[dict]:
+def send_telegram_message(text: str) -> None:
     payload = {
-        "timeout": timeout_sec,
-        "allowed_updates": json.dumps(["message"]),
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",
     }
-    if offset is not None:
-        payload["offset"] = offset
-    data = tg_api("getUpdates", payload, timeout=timeout_sec + 10)
+    print(f"[bot] sending message to chat_id={TELEGRAM_CHAT_ID}: {text[:120]!r}")
+    try:
+        tg_api("sendMessage", payload, timeout=20)
+        print("[bot] message sent successfully")
+    except Exception as e:
+        print(f"[Telegram send error] {e}")
+
+
+def get_updates(offset: int) -> List[dict]:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    payload = {
+        "offset": offset,
+        "timeout": 25,
+        "allowed_updates": ["message"],
+    }
+    resp = requests.post(url, json=payload, timeout=35)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram getUpdates error: {data}")
     return data.get("result", [])
 
 
-def normalize_command(text: str) -> str:
-    text = (text or "").strip()
-    if not text.startswith("/"):
-        return ""
-    cmd = text.split()[0].lower()
-    if "@" in cmd:
-        cmd = cmd.split("@", 1)[0]
-    return cmd
-
-
-# =========================================================
-# TWELVE DATA HELPERS
-# =========================================================
-def td_time_series(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
+# =========================================
+# TWELVE DATA
+# =========================================
+def get_twelvedata_candles(symbol: str, interval: str, outputsize: int) -> List[Candle]:
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
         "interval": interval,
         "outputsize": outputsize,
+        "timezone": SOURCE_TIMEZONE,
+        "apikey": TWELVE_DATA_API_KEY,
         "format": "JSON",
-        "timezone": "UTC",
-        "order": "ASC",
-        "apikey": TWELVEDATA_API_KEY,
     }
-    resp = requests.get(url, params=params, timeout=40)
+    resp = requests.get(url, params=params, timeout=30)
     resp.raise_for_status()
     data = resp.json()
 
     if data.get("status") == "error":
-        raise RuntimeError(f"TwelveData error: {data}")
+        raise RuntimeError(f"Twelve Data error: {data}")
 
     values = data.get("values", [])
     if not values:
-        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close"])
-
-    df = pd.DataFrame(values).copy()
-
-    # Twelve Data usually returns 'datetime'
-    time_col = "datetime" if "datetime" in df.columns else "timestamp"
-    df = df[[time_col, "open", "high", "low", "close"]].copy()
-    df.columns = ["timestamp", "open", "high", "low", "close"]
-
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-    for c in ["open", "high", "low", "close"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df = df.dropna(subset=["timestamp", "open", "high", "low", "close"]).copy()
-    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
-
-    # Basic candle sanity
-    df = df[
-        (df["high"] >= df["low"]) &
-        (df["high"] >= df["open"]) &
-        (df["high"] >= df["close"]) &
-        (df["low"] <= df["open"]) &
-        (df["low"] <= df["close"])
-    ].copy()
-
-    return df.reset_index(drop=True)
-
-
-# =========================================================
-# STATE
-# =========================================================
-@dataclass
-class PendingSignal:
-    bos_key: str
-    direction: str
-    setup_time: str           # ISO UTC
-    entry: float
-    sl: float
-    tp: float
-    sl_distance: float
-    ob_time: str              # ISO UTC
-    ob_zone_low: float
-    ob_zone_high: float
-    expires_at: str           # ISO UTC
-    signal_sent: bool = False
-    entry_taken: bool = False
-    entry_time: Optional[str] = None
-    result_sent: bool = False
-    status: str = "waiting_entry"   # waiting_entry / active / closed / expired
-
-
-@dataclass
-class BotState:
-    bot_enabled: bool = False
-    chat_id: Optional[str] = None
-    telegram_offset: Optional[int] = None
-    used_bos_keys: Optional[List[str]] = None
-    active_trade: Optional[Dict[str, Any]] = None
-    pending_signal: Optional[Dict[str, Any]] = None
-
-    def __post_init__(self):
-        if self.used_bos_keys is None:
-            self.used_bos_keys = []
-
-
-def load_state() -> BotState:
-    if not os.path.exists(STATE_PATH):
-        return BotState(chat_id=TELEGRAM_CHAT_ID or None)
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        state = BotState(**raw)
-        if not state.chat_id and TELEGRAM_CHAT_ID:
-            state.chat_id = TELEGRAM_CHAT_ID
-        return state
-    except Exception as e:
-        print(f"load_state warning: {e}", flush=True)
-        return BotState(chat_id=TELEGRAM_CHAT_ID or None)
-
-
-def save_state(state: BotState) -> None:
-    try:
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(asdict(state), f, indent=2)
-    except Exception as e:
-        print(f"save_state error: {e}", flush=True)
-
-
-STATE_LOCK = threading.Lock()
-
-
-# =========================================================
-# STRATEGY HELPERS
-# =========================================================
-def candle_body_high(row: pd.Series) -> float:
-    return float(max(row["open"], row["close"]))
-
-
-def candle_body_low(row: pd.Series) -> float:
-    return float(min(row["open"], row["close"]))
-
-
-def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    out = (
-        df.set_index("timestamp")[["open", "high", "low", "close"]]
-        .resample(rule)
-        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
-        .dropna()
-        .reset_index()
-    )
-    return out
-
-
-def build_confirmed_pivots(m15: pd.DataFrame, swing_window: int = 2) -> pd.DataFrame:
-    df = m15.copy()
-    n = swing_window
-
-    df["pivot_high"] = df["high"].where(
-        df["high"] == df["high"].rolling(2 * n + 1, center=True).max()
-    )
-    df["pivot_low"] = df["low"].where(
-        df["low"] == df["low"].rolling(2 * n + 1, center=True).min()
-    )
-
-    tf_delta = pd.Timedelta(minutes=15)
-    df["pivot_high_confirmed_at"] = pd.NaT
-    df["pivot_low_confirmed_at"] = pd.NaT
-
-    hi_mask = df["pivot_high"].notna()
-    lo_mask = df["pivot_low"].notna()
-
-    df.loc[hi_mask, "pivot_high_confirmed_at"] = df.loc[hi_mask, "timestamp"] + n * tf_delta
-    df.loc[lo_mask, "pivot_low_confirmed_at"] = df.loc[lo_mask, "timestamp"] + n * tf_delta
-
-    return df
-
-
-def get_ob_zone(ob_row: pd.Series, bullish: bool, use_body: bool = True) -> Tuple[float, float, float]:
-    if use_body:
-        zone_low = candle_body_low(ob_row)
-        zone_high = candle_body_high(ob_row)
-    else:
-        zone_low = float(ob_row["low"])
-        zone_high = float(ob_row["high"])
-
-    ob_extreme = float(ob_row["low"]) if bullish else float(ob_row["high"])
-    return zone_low, zone_high, ob_extreme
-
-
-def to_ist_str(ts: pd.Timestamp) -> str:
-    ts = pd.Timestamp(ts)
-    if ts.tzinfo is None:
-        ts = ts.tz_localize("UTC")
-    return ts.tz_convert(OUTPUT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
-
-
-def iso_utc(ts: pd.Timestamp) -> str:
-    ts = pd.Timestamp(ts)
-    if ts.tzinfo is None:
-        ts = ts.tz_localize("UTC")
-    return ts.tz_convert("UTC").isoformat()
-
-
-def parse_ts(s: str) -> pd.Timestamp:
-    return pd.Timestamp(s).tz_convert("UTC")
-
-
-def format_price(x: float) -> str:
-    return f"{x:.2f}"
-
-
-def format_signal_message(sig: PendingSignal) -> str:
-    side = "BUY" if sig.direction == "long" else "SELL"
-    return (
-        f"📡 XAUUSD SMC signal detected\n"
-        f"Type: {side}\n"
-        f"Signal time: {to_ist_str(parse_ts(sig.setup_time))}\n"
-        f"Entry: {format_price(sig.entry)}\n"
-        f"SL: {format_price(sig.sl)}\n"
-        f"TP: {format_price(sig.tp)}\n"
-        f"RR: 1:{RR:.0f}\n"
-        f"SL Distance: {sig.sl_distance:.2f}\n"
-        f"OB Time: {to_ist_str(parse_ts(sig.ob_time))}\n"
-        f"Valid until: {to_ist_str(parse_ts(sig.expires_at))}"
-    )
-
-
-def format_entry_message(sig: PendingSignal) -> str:
-    side = "BUY" if sig.direction == "long" else "SELL"
-    return (
-        f"✅ XAUUSD entry taken\n"
-        f"Type: {side}\n"
-        f"Entry time: {to_ist_str(parse_ts(sig.entry_time))}\n"
-        f"Entry: {format_price(sig.entry)}\n"
-        f"SL: {format_price(sig.sl)}\n"
-        f"TP: {format_price(sig.tp)}\n"
-        f"RR: 1:{RR:.0f}"
-    )
-
-
-def format_result_message(sig: PendingSignal, result: str, exit_time: pd.Timestamp, pnl_points: float) -> str:
-    emoji = "🟢" if result == "win" else "🔴"
-    side = "BUY" if sig.direction == "long" else "SELL"
-    return (
-        f"{emoji} XAUUSD trade result\n"
-        f"Type: {side}\n"
-        f"Entry time: {to_ist_str(parse_ts(sig.entry_time))}\n"
-        f"Exit time: {to_ist_str(exit_time)}\n"
-        f"Entry: {format_price(sig.entry)}\n"
-        f"SL: {format_price(sig.sl)}\n"
-        f"TP: {format_price(sig.tp)}\n"
-        f"Result: {result.upper()}\n"
-        f"PnL Points: {pnl_points:.2f}"
-    )
-
-
-def format_expired_message(sig: PendingSignal) -> str:
-    side = "BUY" if sig.direction == "long" else "SELL"
-    return (
-        f"⌛ XAUUSD signal expired\n"
-        f"Type: {side}\n"
-        f"Signal time: {to_ist_str(parse_ts(sig.setup_time))}\n"
-        f"Entry was not triggered within the waiting window."
-    )
-
-
-# =========================================================
-# SMC DETECTION
-# =========================================================
-def detect_latest_smc_signal(m15: pd.DataFrame, used_bos_keys: set) -> Optional[PendingSignal]:
-    """
-    Detects only the latest valid, not-yet-used SMC setup.
-    Setup logic:
-      - M15 close breaks last confirmed pivot high/low
-      - find last opposite candle within previous N M15 candles
-      - entry at OB midpoint
-      - SL beyond OB extreme +/- buffer
-      - enforce min stop and SL > 0.49 filter
-    """
-    if m15.empty:
-        return None
-
-    m15 = build_confirmed_pivots(m15, SMC_SWING_WINDOW).reset_index(drop=True)
-
-    start_i = max(10, SMC_SWING_WINDOW * 2 + 2)
-    latest_signal: Optional[PendingSignal] = None
-
-    for i in range(start_i, len(m15)):
-        row = m15.iloc[i]
-        now = row["timestamp"]
-
-        hist = m15.iloc[:i].copy()
-
-        piv_hi = hist[
-            hist["pivot_high"].notna() &
-            (hist["pivot_high_confirmed_at"] <= now)
-        ]
-        piv_lo = hist[
-            hist["pivot_low"].notna() &
-            (hist["pivot_low_confirmed_at"] <= now)
-        ]
-
-        last_hi = piv_hi.iloc[-1] if not piv_hi.empty else None
-        last_lo = piv_lo.iloc[-1] if not piv_lo.empty else None
-
-        direction = None
-        bos_key = None
-
-        if last_hi is not None and row["close"] > last_hi["pivot_high"]:
-            bos_key = f"bull|{pd.Timestamp(last_hi['timestamp']).isoformat()}"
-            if bos_key not in used_bos_keys:
-                direction = "long"
-
-        elif last_lo is not None and row["close"] < last_lo["pivot_low"]:
-            bos_key = f"bear|{pd.Timestamp(last_lo['timestamp']).isoformat()}"
-            if bos_key not in used_bos_keys:
-                direction = "short"
-
-        if direction is None or bos_key is None:
-            continue
-
-        prev_block = m15.iloc[max(0, i - SMC_OB_SEARCH_BACK):i].copy()
-        if prev_block.empty:
-            continue
-
-        if direction == "long":
-            ob_candidates = prev_block[prev_block["close"] < prev_block["open"]]
-            if ob_candidates.empty:
-                continue
-            ob = ob_candidates.iloc[-1]
-            zone_low, zone_high, ob_extreme = get_ob_zone(ob, bullish=True, use_body=SMC_OB_USE_BODY)
-            entry = (zone_low + zone_high) / 2.0
-            sl = ob_extreme - PRICE_BUFFER
-            if entry - sl < MIN_STOP_DISTANCE:
-                sl = entry - MIN_STOP_DISTANCE
-            risk = entry - sl
-            tp = entry + RR * risk
-
-        else:
-            ob_candidates = prev_block[prev_block["close"] > prev_block["open"]]
-            if ob_candidates.empty:
-                continue
-            ob = ob_candidates.iloc[-1]
-            zone_low, zone_high, ob_extreme = get_ob_zone(ob, bullish=False, use_body=SMC_OB_USE_BODY)
-            entry = (zone_low + zone_high) / 2.0
-            sl = ob_extreme + PRICE_BUFFER
-            if sl - entry < MIN_STOP_DISTANCE:
-                sl = entry + MIN_STOP_DISTANCE
-            risk = sl - entry
-            tp = entry - RR * risk
-
-        if risk <= MIN_SL_FILTER:
-            continue
-
-        expires_at = row["timestamp"] + pd.Timedelta(minutes=ENTRY_WAIT_BARS_SMC)
-
-        latest_signal = PendingSignal(
-            bos_key=bos_key,
-            direction=direction,
-            setup_time=iso_utc(row["timestamp"]),
-            entry=float(entry),
-            sl=float(sl),
-            tp=float(tp),
-            sl_distance=float(risk),
-            ob_time=iso_utc(ob["timestamp"]),
-            ob_zone_low=float(zone_low),
-            ob_zone_high=float(zone_high),
-            expires_at=iso_utc(expires_at),
+        raise RuntimeError("No candle data returned from Twelve Data.")
+
+    rows: List[Candle] = []
+    for v in values:
+        rows.append(
+            Candle(
+                timestamp=v["datetime"],
+                open=float(v["open"]),
+                high=float(v["high"]),
+                low=float(v["low"]),
+                close=float(v["close"]),
+            )
         )
 
-    return latest_signal
+    rows.sort(key=lambda r: r.timestamp)
+    return rows
 
 
-# =========================================================
-# ENTRY / RESULT MONITORING
-# =========================================================
-def find_entry_touch(m1: pd.DataFrame, sig: PendingSignal) -> Optional[pd.Timestamp]:
-    setup_time = parse_ts(sig.setup_time)
-    expires_at = parse_ts(sig.expires_at)
+# =========================================
+# STRATEGY CORE
+# =========================================
+def build_pivots(rows: List[Candle], n: int):
+    pivot_high = [None] * len(rows)
+    pivot_low = [None] * len(rows)
 
-    window = m1[(m1["timestamp"] > setup_time) & (m1["timestamp"] <= expires_at)].copy()
-    if window.empty:
+    for i in range(n, len(rows) - n):
+        is_high = True
+        is_low = True
+        for j in range(i - n, i + n + 1):
+            if rows[j].high > rows[i].high:
+                is_high = False
+            if rows[j].low < rows[i].low:
+                is_low = False
+            if not is_high and not is_low:
+                break
+        if is_high:
+            pivot_high[i] = rows[i].high
+        if is_low:
+            pivot_low[i] = rows[i].low
+
+    return pivot_high, pivot_low
+
+
+def find_last_pivot_index(pivot_array: List[Optional[float]], max_idx: int) -> int:
+    for i in range(max_idx, -1, -1):
+        if pivot_array[i] is not None:
+            return i
+    return -1
+
+
+def detect_smc_signal(rows: List[Candle], rr: float) -> Optional[Signal]:
+    n = SWING_WINDOW
+    i = len(rows) - 2  # latest closed candle
+
+    if i < max(10, 2 * n + 2):
         return None
 
-    for _, r in window.iterrows():
-        if float(r["low"]) <= sig.entry <= float(r["high"]):
-            return pd.Timestamp(r["timestamp"]).tz_convert("UTC")
+    pivot_high, pivot_low = build_pivots(rows, n)
+    latest = rows[i]
 
-    return None
+    last_high_idx = find_last_pivot_index(pivot_high, i - 1)
+    last_low_idx = find_last_pivot_index(pivot_low, i - 1)
 
-
-def resolve_trade_after_entry(m1: pd.DataFrame, sig: PendingSignal) -> Optional[Tuple[pd.Timestamp, str, float]]:
-    """
-    Returns (exit_time, result, pnl_points) if trade has already finished,
-    else returns None.
-    """
-    if not sig.entry_taken or not sig.entry_time:
+    direction = None
+    if last_high_idx != -1 and latest.close > float(pivot_high[last_high_idx]):
+        direction = "long"
+    elif last_low_idx != -1 and latest.close < float(pivot_low[last_low_idx]):
+        direction = "short"
+    else:
         return None
 
-    entry_time = parse_ts(sig.entry_time)
-    end_time = entry_time + pd.Timedelta(minutes=MAX_HOLD_BARS)
+    start = max(0, i - OB_LOOKBACK)
+    ob_idx = -1
 
-    window = m1[m1["timestamp"] >= entry_time].copy()
-    if window.empty:
+    if direction == "long":
+        for k in range(i - 1, start - 1, -1):
+            if rows[k].close < rows[k].open:
+                ob_idx = k
+                break
+
+        if ob_idx == -1:
+            return None
+
+        zone_low = min(rows[ob_idx].open, rows[ob_idx].close)
+        zone_high = max(rows[ob_idx].open, rows[ob_idx].close)
+        entry = round5((zone_low + zone_high) / 2.0)
+        sl = round5(rows[ob_idx].low - SL_BUFFER)
+        risk = round5(entry - sl)
+
+        if not (risk > MIN_SL_DISTANCE):
+            return None
+
+        tp = round5(entry + rr * risk)
+        bos_epoch = parse_twelvedata_datetime_utc(latest.timestamp)
+
+        return Signal(
+            signal_id=f"long_{latest.timestamp}",
+            direction="long",
+            bos_time=latest.timestamp,
+            ob_time=rows[ob_idx].timestamp,
+            zone_low=round5(zone_low),
+            zone_high=round5(zone_high),
+            entry=entry,
+            sl=sl,
+            tp=tp,
+            risk=risk,
+            expires_at_epoch=bos_epoch + ENTRY_WAIT_BARS * 60,
+            sent_entry_alert=False,
+            is_active_trade=False,
+            entry_time=None,
+        )
+
+    for k in range(i - 1, start - 1, -1):
+        if rows[k].close > rows[k].open:
+            ob_idx = k
+            break
+
+    if ob_idx == -1:
         return None
 
-    # Restrict to available data and hold window
-    window = window[window["timestamp"] <= end_time].copy()
-    if window.empty:
+    zone_low = min(rows[ob_idx].open, rows[ob_idx].close)
+    zone_high = max(rows[ob_idx].open, rows[ob_idx].close)
+    entry = round5((zone_low + zone_high) / 2.0)
+    sl = round5(rows[ob_idx].high + SL_BUFFER)
+    risk = round5(sl - entry)
+
+    if not (risk > MIN_SL_DISTANCE):
         return None
 
-    for _, row in window.iterrows():
-        hi = float(row["high"])
-        lo = float(row["low"])
-        ts = pd.Timestamp(row["timestamp"]).tz_convert("UTC")
+    tp = round5(entry - rr * risk)
+    bos_epoch = parse_twelvedata_datetime_utc(latest.timestamp)
 
-        if sig.direction == "long":
-            hit_sl = lo <= sig.sl
-            hit_tp = hi >= sig.tp
-
-            if hit_sl and hit_tp:
-                if CONSERVATIVE_SAME_CANDLE:
-                    return ts, "loss", sig.entry - sig.sl
-                return ts, "win", sig.tp - sig.entry
-            elif hit_sl:
-                return ts, "loss", sig.entry - sig.sl
-            elif hit_tp:
-                return ts, "win", sig.tp - sig.entry
-
-        else:
-            hit_sl = hi >= sig.sl
-            hit_tp = lo <= sig.tp
-
-            if hit_sl and hit_tp:
-                if CONSERVATIVE_SAME_CANDLE:
-                    return ts, "loss", sig.sl - sig.entry
-                return ts, "win", sig.entry - sig.tp
-            elif hit_sl:
-                return ts, "loss", sig.sl - sig.entry
-            elif hit_tp:
-                return ts, "win", sig.entry - sig.tp
-
-    # If max-hold window has fully passed and still no TP/SL, close by last available close
-    latest_ts = pd.Timestamp(window.iloc[-1]["timestamp"]).tz_convert("UTC")
-    if latest_ts >= end_time:
-        last_close = float(window.iloc[-1]["close"])
-        if sig.direction == "long":
-            pnl = last_close - sig.entry
-        else:
-            pnl = sig.entry - last_close
-        result = "win" if pnl > 0 else "loss"
-        return latest_ts, result, pnl
-
-    return None
+    return Signal(
+        signal_id=f"short_{latest.timestamp}",
+        direction="short",
+        bos_time=latest.timestamp,
+        ob_time=rows[ob_idx].timestamp,
+        zone_low=round5(zone_low),
+        zone_high=round5(zone_high),
+        entry=entry,
+        sl=sl,
+        tp=tp,
+        risk=risk,
+        expires_at_epoch=bos_epoch + ENTRY_WAIT_BARS * 60,
+        sent_entry_alert=False,
+        is_active_trade=False,
+        entry_time=None,
+    )
 
 
-# =========================================================
-# BOT CORE
-# =========================================================
-def process_commands(state: BotState) -> BotState:
-    try:
-        updates = get_updates(state.telegram_offset, timeout_sec=25)
-    except Exception as e:
-        print(f"getUpdates error: {e}", flush=True)
-        return state
+def manage_pending_trade(rows: List[Candle]) -> None:
+    with state_lock:
+        pending_raw = state["pending_signal"]
+        rr = state["rr"]
 
-    for upd in updates:
-        state.telegram_offset = int(upd["update_id"]) + 1
+    if not pending_raw:
+        return
 
-        msg = upd.get("message", {})
-        chat = msg.get("chat", {})
-        chat_id = str(chat.get("id")) if chat.get("id") is not None else None
-        text = msg.get("text", "") or ""
-        cmd = normalize_command(text)
+    sig = Signal(**pending_raw)
 
-        if not cmd:
+    # -------------------------
+    # WAIT FOR ENTRY
+    # -------------------------
+    if not sig.is_active_trade:
+        bos_epoch = parse_twelvedata_datetime_utc(sig.bos_time)
+
+        for r in rows:
+            r_epoch = parse_twelvedata_datetime_utc(r.timestamp)
+            if r_epoch <= bos_epoch:
+                continue
+            if r_epoch > sig.expires_at_epoch:
+                break
+
+            if r.low <= sig.entry <= r.high:
+                sig.is_active_trade = True
+                sig.entry_time = r.timestamp
+
+                if not sig.sent_entry_alert:
+                    send_telegram_message(
+                        "📍 *ENTRY ALERT — XAUUSD SMC*\n"
+                        f"Direction: *{sig.direction.upper()}*\n"
+                        f"Entry time: `{sig.entry_time}`\n"
+                        f"Entry: `{sig.entry}`\n"
+                        f"SL: `{sig.sl}`\n"
+                        f"TP: `{sig.tp}`\n"
+                        f"RR: `1:{rr}`"
+                    )
+                    sig.sent_entry_alert = True
+
+                with state_lock:
+                    state["pending_signal"] = asdict(sig)
+                print(f"[bot] Trade activated: {sig.signal_id}")
+                break
+
+        if not sig.is_active_trade:
+            last_closed_epoch = parse_twelvedata_datetime_utc(rows[-2].timestamp)
+            if last_closed_epoch > sig.expires_at_epoch:
+                send_telegram_message(
+                    "⌛ *Signal expired*\n"
+                    f"Direction: *{sig.direction.upper()}*\n"
+                    "Entry was not triggered before expiry."
+                )
+                print(f"[bot] Signal expired: {sig.signal_id}")
+                with state_lock:
+                    state["pending_signal"] = None
+            return
+
+    # -------------------------
+    # MANAGE ACTIVE TRADE
+    # -------------------------
+    bars_from_entry = 0
+
+    for r in rows:
+        if not sig.entry_time:
+            continue
+        if parse_twelvedata_datetime_utc(r.timestamp) < parse_twelvedata_datetime_utc(sig.entry_time):
             continue
 
-        # Learn chat_id automatically if not fixed
-        if chat_id and not state.chat_id:
-            state.chat_id = chat_id
+        bars_from_entry += 1
 
-        if cmd == "/startbot":
-            state.bot_enabled = True
-            if chat_id:
-                state.chat_id = chat_id
-            save_state(state)
+        if sig.direction == "long":
+            hit_sl = r.low <= sig.sl
+            hit_tp = r.high >= sig.tp
+
+            # conservative same-candle conflict = SL
+            if hit_sl or hit_tp:
+                outcome = "loss" if hit_sl else "win"
+                pnl = round5((sig.entry - sig.sl) if hit_sl else (sig.tp - sig.entry))
+                send_telegram_message(
+                    ("❌" if outcome == "loss" else "✅") + " *RESULT — XAUUSD SMC*\n"
+                    "Direction: *LONG*\n"
+                    f"Entry time: `{sig.entry_time}`\n"
+                    f"Exit time: `{r.timestamp}`\n"
+                    f"Entry: `{sig.entry}`\n"
+                    f"SL: `{sig.sl}`\n"
+                    f"TP: `{sig.tp}`\n"
+                    f"Outcome: *{outcome.upper()}*\n"
+                    f"PnL points: `{pnl}`"
+                )
+                print(f"[bot] Trade closed: {sig.signal_id}, outcome={outcome}")
+                with state_lock:
+                    state["pending_signal"] = None
+                return
+
+        else:
+            hit_sl = r.high >= sig.sl
+            hit_tp = r.low <= sig.tp
+
+            # conservative same-candle conflict = SL
+            if hit_sl or hit_tp:
+                outcome = "loss" if hit_sl else "win"
+                pnl = round5((sig.sl - sig.entry) if hit_sl else (sig.entry - sig.tp))
+                send_telegram_message(
+                    ("❌" if outcome == "loss" else "✅") + " *RESULT — XAUUSD SMC*\n"
+                    "Direction: *SHORT*\n"
+                    f"Entry time: `{sig.entry_time}`\n"
+                    f"Exit time: `{r.timestamp}`\n"
+                    f"Entry: `{sig.entry}`\n"
+                    f"SL: `{sig.sl}`\n"
+                    f"TP: `{sig.tp}`\n"
+                    f"Outcome: *{outcome.upper()}*\n"
+                    f"PnL points: `{pnl}`"
+                )
+                print(f"[bot] Trade closed: {sig.signal_id}, outcome={outcome}")
+                with state_lock:
+                    state["pending_signal"] = None
+                return
+
+        if bars_from_entry >= MAX_TRADE_BARS:
             send_telegram_message(
-                "✅ XAUUSD SMC bot is online.\n"
-                "Logic: M15 BOS → last opposite candle OB → midpoint entry → SL beyond OB → TP 1:2\n"
-                "Status: monitoring live data.",
-                state.chat_id,
+                "⌛ *Trade timeout — XAUUSD SMC*\n"
+                f"Direction: *{sig.direction.upper()}*\n"
+                "Trade closed due to max holding bars without TP/SL hit."
             )
-
-        elif cmd == "/stopbot":
-            state.bot_enabled = False
-            save_state(state)
-            send_telegram_message("🛑 XAUUSD SMC bot stopped.", state.chat_id)
-
-        elif cmd == "/statusbot":
-            pending = "None"
-            if state.pending_signal:
-                pending = state.pending_signal.get("status", "unknown")
-            active = "Yes" if state.active_trade else "No"
-
-            send_telegram_message(
-                f"📊 XAUUSD SMC bot status\n"
-                f"Enabled: {state.bot_enabled}\n"
-                f"Symbol: {SYMBOL}\n"
-                f"RR: 1:{RR:.0f}\n"
-                f"Pending signal: {pending}\n"
-                f"Active trade: {active}\n"
-                f"Chat ID saved: {bool(state.chat_id)}",
-                state.chat_id,
-            )
-
-        elif cmd == "/resetbot":
-            state.pending_signal = None
-            state.active_trade = None
-            state.used_bos_keys = []
-            save_state(state)
-            send_telegram_message("♻️ XAUUSD SMC bot state reset.", state.chat_id)
-
-        elif cmd == "/help":
-            send_telegram_message(
-                "Commands:\n"
-                "/startbot\n"
-                "/stopbot\n"
-                "/statusbot\n"
-                "/resetbot\n"
-                "/help",
-                state.chat_id,
-            )
-
-    return state
+            print(f"[bot] Trade timeout: {sig.signal_id}")
+            with state_lock:
+                state["pending_signal"] = None
+            return
 
 
-def scan_and_trade(state: BotState) -> BotState:
-    if not state.bot_enabled:
-        return state
+# =========================================
+# BOT COMMANDS
+# =========================================
+def get_status_text() -> str:
+    with state_lock:
+        enabled = state["bot_enabled"]
+        rr = state["rr"]
+        pending = state["pending_signal"]
+        last_signal_id = state["last_signal_id"]
 
-    # Enforce one trade at a time
-    if ONE_TRADE_AT_A_TIME and state.active_trade is not None:
-        sig = PendingSignal(**state.active_trade)
-        m1 = td_time_series(SYMBOL, "1min", TD_OUTPUTSIZE_1M)
-        result = resolve_trade_after_entry(m1, sig)
-        if result is not None and not sig.result_sent:
-            exit_time, outcome, pnl_points = result
-            send_telegram_message(format_result_message(sig, outcome, exit_time, pnl_points), state.chat_id)
-            sig.result_sent = True
-            sig.status = "closed"
-            state.active_trade = None
-            save_state(state)
-        return state
+    active_trade = False
+    pending_signal = False
+    if pending:
+        pending_signal = True
+        active_trade = bool(pending.get("is_active_trade"))
 
-    # If pending signal exists, monitor it first
-    if state.pending_signal is not None:
-        sig = PendingSignal(**state.pending_signal)
-        now_utc = pd.Timestamp.utcnow().tz_localize("UTC") if pd.Timestamp.utcnow().tzinfo is None else pd.Timestamp.utcnow().tz_convert("UTC")
-
-        # Send signal once
-        if not sig.signal_sent:
-            send_telegram_message(format_signal_message(sig), state.chat_id)
-            sig.signal_sent = True
-            state.pending_signal = asdict(sig)
-            save_state(state)
-
-        # Check expiry before entry
-        if now_utc > parse_ts(sig.expires_at) and not sig.entry_taken:
-            send_telegram_message(format_expired_message(sig), state.chat_id)
-            sig.status = "expired"
-            state.pending_signal = None
-            # Mark BOS as used so it won't spam repeatedly
-            if sig.bos_key not in state.used_bos_keys:
-                state.used_bos_keys.append(sig.bos_key)
-            save_state(state)
-            return state
-
-        # Check if entry was taken
-        m1 = td_time_series(SYMBOL, "1min", TD_OUTPUTSIZE_1M)
-        if not sig.entry_taken:
-            entry_time = find_entry_touch(m1, sig)
-            if entry_time is not None:
-                sig.entry_taken = True
-                sig.entry_time = iso_utc(entry_time)
-                sig.status = "active"
-                send_telegram_message(format_entry_message(sig), state.chat_id)
-
-                # Move to active trade
-                state.active_trade = asdict(sig)
-                state.pending_signal = None
-                if sig.bos_key not in state.used_bos_keys:
-                    state.used_bos_keys.append(sig.bos_key)
-                save_state(state)
-                return state
-
-        state.pending_signal = asdict(sig)
-        save_state(state)
-        return state
-
-    # No pending signal and no active trade: scan for new setup
-    m1 = td_time_series(SYMBOL, "1min", TD_OUTPUTSIZE_1M)
-    m15 = resample_ohlc(m1, SMC_ENTRY_TF)
-
-    used = set(state.used_bos_keys or [])
-    sig = detect_latest_smc_signal(m15, used)
-
-    if sig is not None:
-        # Avoid stale setups that are already expired before we even send them
-        now_utc = pd.Timestamp.utcnow().tz_localize("UTC") if pd.Timestamp.utcnow().tzinfo is None else pd.Timestamp.utcnow().tz_convert("UTC")
-        if parse_ts(sig.expires_at) > now_utc:
-            state.pending_signal = asdict(sig)
-            save_state(state)
-
-    return state
+    return (
+        "*SMC bot status*\n"
+        f"Enabled: `{enabled}`\n"
+        f"RR: `1:{rr}`\n"
+        f"Min SL distance: `>{MIN_SL_DISTANCE}`\n"
+        f"Pending signal: `{pending_signal}`\n"
+        f"Active trade: `{active_trade}`\n"
+        f"Last signal ID: `{last_signal_id or 'none'}`"
+    )
 
 
-def bot_loop():
-    print("Starting bot loop...", flush=True)
-    telegram_delete_webhook()
+def handle_command(text: str) -> None:
+    parts = text.strip().split()
+    command = parts[0].lower().split("@")[0]
 
-    state = load_state()
-    save_state(state)
+    print(f"[bot] command received: {command}, full text: {text!r}")
 
+    if command == "/startbt":
+        with state_lock:
+            state["bot_enabled"] = True
+            rr = state["rr"]
+        send_telegram_message(
+            "✅ *SMC bot started*\n"
+            f"Monitoring *{SYMBOL}* on `{INTERVAL}` candles.\n"
+            f"RR: `1:{rr}`\n"
+            f"Min SL distance: `>{MIN_SL_DISTANCE}`"
+        )
+        return
+
+    if command == "/stopbt":
+        with state_lock:
+            state["bot_enabled"] = False
+        send_telegram_message("🛑 *SMC bot stopped*")
+        return
+
+    if command == "/statusbt":
+        send_telegram_message(get_status_text())
+        return
+
+    if command == "/setrr":
+        if len(parts) < 2:
+            send_telegram_message("Usage: `/setrr 3`")
+            return
+        try:
+            rr = float(parts[1])
+            if rr <= 0:
+                raise ValueError
+        except ValueError:
+            send_telegram_message("❌ Invalid RR value.")
+            return
+
+        with state_lock:
+            state["rr"] = rr
+        send_telegram_message(f"✅ RR updated to `1:{rr}`")
+        return
+
+    if command == "/resetbot":
+        with state_lock:
+            state["bot_enabled"] = False
+            state["rr"] = DEFAULT_RR
+            state["last_signal_id"] = None
+            state["pending_signal"] = None
+        send_telegram_message("♻️ Bot state cleared.")
+        return
+
+    if command == "/testmsg":
+        send_telegram_message("✅ Bot command system is working.")
+        return
+
+    send_telegram_message(
+        "Unknown command.\n\n"
+        "Available commands:\n"
+        "`/startbt`\n"
+        "`/stopbt`\n"
+        "`/statusbt`\n"
+        "`/setrr 3`\n"
+        "`/testmsg`\n"
+        "`/resetbot`"
+    )
+
+
+# =========================================
+# BACKGROUND LOOPS
+# =========================================
+def telegram_poll_loop() -> None:
+    print("[bot] Telegram polling loop started")
     while True:
         try:
-            with STATE_LOCK:
-                state = load_state()
-                state = process_commands(state)
-                state = scan_and_trade(state)
-                save_state(state)
+            with state_lock:
+                offset = int(state["telegram_offset"])
+
+            updates = get_updates(offset)
+            if updates:
+                print(f"[bot] updates count = {len(updates)}")
+
+            for upd in updates:
+                print("[bot] raw update:", json.dumps(upd))
+
+                new_offset = int(upd["update_id"]) + 1
+                with state_lock:
+                    state["telegram_offset"] = new_offset
+
+                msg = upd.get("message") or {}
+                chat = msg.get("chat") or {}
+                chat_id = str(chat.get("id", ""))
+                text = str(msg.get("text", "")).strip()
+
+                print(f"[bot] incoming chat_id={chat_id}, expected_chat_id={TELEGRAM_CHAT_ID}, text={text!r}")
+
+                if chat_id != TELEGRAM_CHAT_ID:
+                    print(f"[bot] ignored message from different chat_id={chat_id}")
+                    continue
+
+                if not text.startswith("/"):
+                    print("[bot] ignored non-command message")
+                    continue
+
+                handle_command(text)
 
         except Exception as e:
-            print(f"Main loop error: {e}", flush=True)
+            print(f"[bot] Telegram polling error: {e}")
 
-        time.sleep(POLL_SECONDS)
+        time.sleep(POLL_SLEEP_SECONDS)
 
 
-# =========================================================
+def signal_loop() -> None:
+    print("[bot] Signal loop started")
+    while True:
+        try:
+            with state_lock:
+                enabled = state["bot_enabled"]
+                rr = float(state["rr"])
+
+            if enabled:
+                rows = get_twelvedata_candles(SYMBOL, INTERVAL, LOOKBACK_BARS)
+                print(f"[bot] fetched {len(rows)} candles")
+
+                if len(rows) >= 30:
+                    manage_pending_trade(rows)
+
+                    with state_lock:
+                        has_pending = state["pending_signal"] is not None
+
+                    if not has_pending:
+                        signal = detect_smc_signal(rows, rr)
+                        if signal:
+                            with state_lock:
+                                last_signal_id = state["last_signal_id"]
+
+                            if signal.signal_id != last_signal_id:
+                                with state_lock:
+                                    state["last_signal_id"] = signal.signal_id
+                                    state["pending_signal"] = asdict(signal)
+
+                                print(f"[bot] New signal detected: {signal.signal_id}")
+                                send_telegram_message(
+                                    "🚨 *LIVE SIGNAL DETECTED — XAUUSD SMC*\n"
+                                    f"Direction: *{signal.direction.upper()}*\n"
+                                    f"BOS time: `{signal.bos_time}`\n"
+                                    f"OB time: `{signal.ob_time}`\n"
+                                    f"Zone: `{signal.zone_low} - {signal.zone_high}`\n"
+                                    f"Entry: `{signal.entry}`\n"
+                                    f"SL: `{signal.sl}`\n"
+                                    f"TP: `{signal.tp}`\n"
+                                    f"RR: `1:{rr}`\n"
+                                    f"SL distance: `{signal.risk}`"
+                                )
+                            else:
+                                print(f"[bot] Duplicate signal ignored: {signal.signal_id}")
+                        else:
+                            print("[bot] No new signal on this cycle")
+
+        except Exception as e:
+            print(f"[bot] Signal loop error: {e}")
+
+        time.sleep(SIGNAL_CHECK_SECONDS)
+
+
+def start_background_threads() -> None:
+    t1 = threading.Thread(target=telegram_poll_loop, daemon=True)
+    t2 = threading.Thread(target=signal_loop, daemon=True)
+    t1.start()
+    t2.start()
+    print("[bot] Background threads started")
+
+
+# =========================================
 # MAIN
-# =========================================================
-if __name__ == "__main__":
-    thread = threading.Thread(target=bot_loop, daemon=True)
-    thread.start()
+# =========================================
+require_env()
+clear_telegram_webhook()
+start_background_threads()
 
-    app.run(host="0.0.0.0", port=PORT)
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "10000"))
+    print(f"[bot] Starting Flask app on port {port}")
+    app.run(host="0.0.0.0", port=port)
