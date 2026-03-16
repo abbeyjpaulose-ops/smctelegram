@@ -13,7 +13,7 @@ from flask import Flask, jsonify
 # CONFIG FROM ENV
 # =========================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()  # optional, can be blank
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
 SYMBOL = os.getenv("SYMBOL", "XAU/USD")
@@ -25,17 +25,17 @@ DEFAULT_RR = float(os.getenv("DEFAULT_RR", "2.0"))
 MIN_SL_DISTANCE = float(os.getenv("MIN_SL_DISTANCE", "0.20"))
 SL_BUFFER = float(os.getenv("SL_BUFFER", "0.03"))
 
-LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "120"))          # reduced default for credits
+LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "120"))
 SWING_WINDOW = int(os.getenv("SWING_WINDOW", "2"))
 OB_LOOKBACK = int(os.getenv("OB_LOOKBACK", "8"))
 ENTRY_WAIT_BARS = int(os.getenv("ENTRY_WAIT_BARS", "20"))
 MAX_TRADE_BARS = int(os.getenv("MAX_TRADE_BARS", "180"))
 
 POLL_SLEEP_SECONDS = int(os.getenv("POLL_SLEEP_SECONDS", "2"))
-SIGNAL_CHECK_SECONDS = int(os.getenv("SIGNAL_CHECK_SECONDS", "300"))  # reduced default for credits
+SIGNAL_CHECK_SECONDS = int(os.getenv("SIGNAL_CHECK_SECONDS", "300"))
 
 AUTO_START_BOT = os.getenv("AUTO_START_BOT", "true").strip().lower() == "true"
-AUTO_CAPTURE_CHAT_ID = os.getenv("AUTO_CAPTURE_CHAT_ID", "false").strip().lower() == "true"
+AUTO_CAPTURE_CHAT_ID = os.getenv("AUTO_CAPTURE_CHAT_ID", "true").strip().lower() == "true"
 SEND_RESTART_MESSAGE = os.getenv("SEND_RESTART_MESSAGE", "true").strip().lower() == "true"
 
 # =========================================
@@ -109,9 +109,18 @@ def ping():
 @app.get("/debug/state")
 def debug_state():
     with state_lock:
+        return jsonify({"ok": True, "state": state})
+
+
+@app.get("/debug/telegram")
+def debug_telegram():
+    with state_lock:
         return jsonify({
             "ok": True,
-            "state": state
+            "telegram_offset": state["telegram_offset"],
+            "detected_chat_id": state["detected_chat_id"],
+            "bot_enabled": state["bot_enabled"],
+            "last_error": state["last_error"],
         })
 
 
@@ -128,10 +137,7 @@ def debug_candles():
             "previous": asdict(rows[-2]) if len(rows) >= 2 else None,
         })
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e),
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.get("/debug/signal")
@@ -153,10 +159,16 @@ def debug_signal():
             "last_closed_candle": asdict(rows[-2]) if len(rows) >= 2 else None,
         })
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e),
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/debug/sendtest")
+def debug_sendtest():
+    try:
+        send_telegram_message("✅ Debug route test message from Render")
+        return jsonify({"ok": True, "message": "test sent"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # =========================================
@@ -259,7 +271,7 @@ def clear_telegram_webhook() -> None:
 def send_telegram_message(text: str) -> None:
     chat_id = get_effective_chat_id()
     if not chat_id:
-        print("[bot] send skipped: no chat_id available")
+        print("[bot] send skipped: no chat_id available yet")
         return
 
     payload = {
@@ -604,7 +616,7 @@ def get_status_text() -> str:
         f"Min SL distance: `>{MIN_SL_DISTANCE}`\n"
         f"Pending signal: `{pending_signal}`\n"
         f"Active trade: `{active_trade}`\n"
-        f"Detected Chat ID: `{detected_chat_id or 'not set'}`\n"
+        f"Detected Chat ID: `{detected_chat_id or 'not set yet'}`\n"
         f"Last signal ID: `{last_signal_id or 'none'}`\n"
         f"Last candle fetch count: `{last_fetch}`\n"
         f"Last closed candle: `{last_closed or 'none'}`\n"
@@ -697,11 +709,10 @@ def telegram_poll_loop() -> None:
     print("[bot] Telegram polling loop started")
     while True:
         try:
-            print("[bot] telegram loop heartbeat")
-
             with state_lock:
                 offset = int(state["telegram_offset"])
 
+            print(f"[bot] polling Telegram with offset={offset}")
             updates = get_updates(offset)
 
             if updates:
@@ -719,12 +730,19 @@ def telegram_poll_loop() -> None:
                 chat_id = str(chat.get("id", ""))
                 text = str(msg.get("text", "")).strip()
 
-                print(f"[bot] incoming chat_id={chat_id}, expected_chat_id={get_effective_chat_id()}, text={text!r}")
+                print(f"[bot] incoming chat_id={chat_id}, current_chat_id={get_effective_chat_id()}, text={text!r}")
 
                 if AUTO_CAPTURE_CHAT_ID and not get_effective_chat_id() and chat_id:
                     with state_lock:
                         state["detected_chat_id"] = chat_id
                     print(f"[bot] auto-detected TELEGRAM_CHAT_ID={chat_id}")
+
+                    if SEND_RESTART_MESSAGE:
+                        send_telegram_message(
+                            "✅ *XAUUSD SMC bot connected*\n"
+                            "Chat ID auto-detected successfully.\n"
+                            "You can now use commands like `/startbt` and `/statusbt`."
+                        )
 
                 effective_chat_id = get_effective_chat_id()
                 if effective_chat_id and chat_id != effective_chat_id:
@@ -741,6 +759,12 @@ def telegram_poll_loop() -> None:
             err = f"Telegram polling error: {e}"
             print(f"[bot] {err}")
             set_last_error(err)
+
+            if "409" in str(e) or "Conflict" in str(e):
+                try:
+                    clear_telegram_webhook()
+                except Exception as inner:
+                    print(f"[bot] webhook clear retry failed: {inner}")
 
         time.sleep(POLL_SLEEP_SECONDS)
 
@@ -868,6 +892,7 @@ require_env()
 clear_telegram_webhook()
 start_background_threads()
 
+# Only send restart message if chat_id is already known at startup
 if SEND_RESTART_MESSAGE and TELEGRAM_CHAT_ID:
     send_telegram_message("✅ XAUUSD SMC bot restarted on Render and background loops started.")
 
