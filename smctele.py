@@ -25,14 +25,14 @@ DEFAULT_RR = float(os.getenv("DEFAULT_RR", "2.0"))
 MIN_SL_DISTANCE = float(os.getenv("MIN_SL_DISTANCE", "0.20"))
 SL_BUFFER = float(os.getenv("SL_BUFFER", "0.03"))
 
-LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "300"))
+LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "120"))          # reduced default for credits
 SWING_WINDOW = int(os.getenv("SWING_WINDOW", "2"))
 OB_LOOKBACK = int(os.getenv("OB_LOOKBACK", "8"))
 ENTRY_WAIT_BARS = int(os.getenv("ENTRY_WAIT_BARS", "20"))
 MAX_TRADE_BARS = int(os.getenv("MAX_TRADE_BARS", "180"))
 
 POLL_SLEEP_SECONDS = int(os.getenv("POLL_SLEEP_SECONDS", "2"))
-SIGNAL_CHECK_SECONDS = int(os.getenv("SIGNAL_CHECK_SECONDS", "60"))
+SIGNAL_CHECK_SECONDS = int(os.getenv("SIGNAL_CHECK_SECONDS", "300"))  # reduced default for credits
 
 AUTO_START_BOT = os.getenv("AUTO_START_BOT", "true").strip().lower() == "true"
 AUTO_CAPTURE_CHAT_ID = os.getenv("AUTO_CAPTURE_CHAT_ID", "false").strip().lower() == "true"
@@ -54,6 +54,8 @@ state: Dict[str, Any] = {
     "last_closed_candle": None,
     "last_signal_scan_time_utc": None,
     "last_error": None,
+    "api_credit_notified": False,
+    "api_resumed_notified": False,
 }
 
 
@@ -94,6 +96,8 @@ def health():
             "last_closed_candle": state["last_closed_candle"],
             "last_signal_scan_time_utc": state["last_signal_scan_time_utc"],
             "last_error": state["last_error"],
+            "api_credit_notified": state["api_credit_notified"],
+            "api_resumed_notified": state["api_resumed_notified"],
         })
 
 
@@ -188,7 +192,7 @@ class Signal:
 # =========================================
 # HELPERS
 # =========================================
-def set_last_error(msg: str) -> None:
+def set_last_error(msg: Optional[str]) -> None:
     with state_lock:
         state["last_error"] = msg
 
@@ -219,6 +223,11 @@ def get_effective_chat_id() -> Optional[str]:
 
 def now_utc_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def is_credit_error(exc: Exception) -> bool:
+    text = str(exc)
+    return ("429" in text) or ("API credits" in text) or ("run out of API credits" in text)
 
 
 # =========================================
@@ -580,6 +589,7 @@ def get_status_text() -> str:
         detected_chat_id = state["detected_chat_id"]
         last_fetch = state["last_candle_fetch_count"]
         last_closed = state["last_closed_candle"]
+        last_error = state["last_error"]
 
     active_trade = False
     pending_signal = False
@@ -597,7 +607,8 @@ def get_status_text() -> str:
         f"Detected Chat ID: `{detected_chat_id or 'not set'}`\n"
         f"Last signal ID: `{last_signal_id or 'none'}`\n"
         f"Last candle fetch count: `{last_fetch}`\n"
-        f"Last closed candle: `{last_closed or 'none'}`"
+        f"Last closed candle: `{last_closed or 'none'}`\n"
+        f"Last error: `{last_error or 'none'}`"
     )
 
 
@@ -652,6 +663,9 @@ def handle_command(text: str) -> None:
             state["rr"] = DEFAULT_RR
             state["last_signal_id"] = None
             state["pending_signal"] = None
+            state["api_credit_notified"] = False
+            state["api_resumed_notified"] = False
+            state["last_error"] = None
         send_telegram_message("♻️ Bot state cleared.")
         return
 
@@ -748,11 +762,27 @@ def signal_loop() -> None:
                 print("[bot] signal scan started")
                 rows = get_twelvedata_candles(SYMBOL, INTERVAL, LOOKBACK_BARS)
 
+                send_resume_notice = False
                 with state_lock:
                     state["last_candle_fetch_count"] = len(rows)
                     state["last_signal_scan_time_utc"] = now_utc_str()
                     if len(rows) >= 2:
                         state["last_closed_candle"] = asdict(rows[-2])
+                    state["last_error"] = None
+
+                    if state["api_credit_notified"]:
+                        state["api_credit_notified"] = False
+                        state["api_resumed_notified"] = True
+                        send_resume_notice = True
+                    else:
+                        state["api_resumed_notified"] = False
+
+                if send_resume_notice:
+                    send_telegram_message(
+                        "✅ *XAUUSD BOT UPDATE*\n\n"
+                        "Twelve Data API is working again.\n"
+                        "Signal scanning has resumed."
+                    )
 
                 print(f"[bot] fetched {len(rows)} candles")
                 if len(rows) >= 2:
@@ -803,6 +833,22 @@ def signal_loop() -> None:
             err = f"Signal loop error: {e}"
             print(f"[bot] {err}")
             set_last_error(err)
+
+            if is_credit_error(e):
+                should_notify = False
+                with state_lock:
+                    if not state["api_credit_notified"]:
+                        state["api_credit_notified"] = True
+                        state["api_resumed_notified"] = False
+                        should_notify = True
+
+                if should_notify:
+                    send_telegram_message(
+                        "⚠️ *XAUUSD BOT WARNING*\n\n"
+                        "Twelve Data API credits have been exhausted for today.\n\n"
+                        "Signal scanning is paused until credits reset.\n\n"
+                        "The bot will automatically resume when the API works again."
+                    )
 
         time.sleep(SIGNAL_CHECK_SECONDS)
 
