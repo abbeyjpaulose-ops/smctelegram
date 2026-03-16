@@ -1,4 +1,5 @@
 python-telegram-bot==13.15
-requests
-pandas
-flask
+flask==3.0.3
+pandas==2.2.2
+requests==2.32.3
+numpy==1.26.4
